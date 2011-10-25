@@ -1,0 +1,16 @@
+
+git clone async-web
+cd async-web
+virtualenv --no-site-packages .
+source bin/activate
+
+# Install libevent ( OSX )
+tar -vzxf libevent-1.4.14b-stable.tar.gz 
+cd libevent-1.4.14b-stable
+./configure
+make -j4
+sudo make install
+
+pip install greenlet
+pip install gevent
+
