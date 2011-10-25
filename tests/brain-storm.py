@@ -23,7 +23,7 @@ routes.post('/', demo, demo.post)
 
 
 # Instaniate the main App
-app = Async()
+app = AsyncServer()
 
 # Require oAuth on all urls
 app.add(OAuth(('/'))
@@ -38,5 +38,25 @@ app.startServer(8080)
 
 
 # With class decorators and filters declared in the constructor
-Async( (OAuth('/'), JSON('/'), Routes(Demo()) ) ).startServer(8080)
+AsyncServer( (OAuth('/'), JSON('/'), Routes(Demo()) ) ).startServer(8080)
+
+
+# Http Client 
+class Client():
+   
+    @client('GET', url='http://www.google.com', filters=())
+    def getGoogle(request, response):
+        # Prints out the google page
+        print request.read()
+    
+    def returnResp(request, response):
+        return request
+
+req = AsyncClient().get(url='http://www.google.com', filters=(Auth('user','pass'), self=Client(), method=Client.returnResp)
+# if no call back is defined, defaults to returning the 'request' object
+req = AsyncClient().get(url='http://www.google.com', filters=(Auth('user','pass')))
+print req.headers
+print req.recv()
+
+
 
