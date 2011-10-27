@@ -52,9 +52,9 @@ class Client():
     def returnResp(request, response):
         return request
 
-req = AsyncClient().get(url='http://www.google.com', filters=(Auth('user','pass'), self=Client(), method=Client.returnResp)
+req = AsyncClient(filters=(Auth('user','pass'))).get(url='http://www.google.com', self=Client(), method=Client.returnResp)
 # if no call back is defined, defaults to returning the 'request' object
-req = AsyncClient().get(url='http://www.google.com', filters=(Auth('user','pass')))
+req = AsyncClient(filters=(OAuth(key='blah'))).get(url='http://www.google.com', timeout=100 )
 print req.headers
 print req.recv()
 
