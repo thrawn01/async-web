@@ -60,7 +60,7 @@ class AsyncClient(object):
     def log(self, msg):
         sys.stderr.write(msg)
     
-    def parseURI(self,uri):
+    def parseURI(self, uri):
         url = urlparse(uri)
         port = int(url.port or 80)
         path = url.path or '/'
@@ -76,11 +76,11 @@ class AsyncClient(object):
         headers = [": ".join(x) for x in headers]
         return "%s %s %s\r\n%s\r\n\r\n" % (method, path, version,"\r\n".join(headers))
 
-    def get(self,url):
+    def get(self, url, timeout=socket._GLOBAL_DEFAULT_TIMEOUT):
         # Parse the URI
         (scheme, host, port, path) = self.parseURI(url)
         # Connect to the remote Host
-        sock = socket.create_connection((host, port))
+        sock = socket.create_connection((host, port), timeout=timeout)
         # Sending the request header
         sock.send(self._request_header('GET', path, (('Host',host),)))
         return sock
