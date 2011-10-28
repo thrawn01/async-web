@@ -38,18 +38,22 @@ class UrlParse(object):
 
 
 class TestUrlParse(TestCase):
-    
+   
+    def setUp(self):
+        self.client = AsyncClient()
+        
     def test_parse_http(self):
-        url = UrlParse("http://localhost:1500")
-        self.assertEquals(url.scheme(),'http')
-        self.assertEquals(url.host(),'localhost')
-        self.assertEquals(url.port(),1500)
-        self.assertEquals(url.path(),'/')
+        (scheme, host, port, path) = self.client.parseURI("http://localhost:1500")
+        self.assertEquals(scheme,'http')
+        self.assertEquals(host,'localhost')
+        self.assertEquals(port,1500)
+        self.assertEquals(path,'/')
 
     def test_parse_raises(self):
-        self.assertRaises(RuntimeError, UrlParse, ("ftp://localhost:1500"))
-        self.assertRaises(RuntimeError, UrlParse, (""))
-        self.assertRaises(RuntimeError, UrlParse, ("this is not a url"))
+        client = AsyncClient()
+        self.assertRaises(RuntimeError, self.client.parseURI, ("ftp://localhost:1500"))
+        self.assertRaises(RuntimeError, self.client.parseURI, (""))
+        self.assertRaises(RuntimeError, self.client.parseURI, ("this is not a url"))
 
 
 class AsyncClient(object):
@@ -69,7 +73,6 @@ class AsyncClient(object):
         if not 'http' in scheme:
             raise RuntimeError("Only (http,https) supported")
 
-        # ( scheme, host, port, path )
         return (scheme, url.hostname, port, path)
 
     def _request_header(self, method, path='/', headers=(), version='HTTP/1.1'):
@@ -111,9 +114,6 @@ class TestAsyncClient(TestCase):
             self.server.stop()
         finally:
             timeout.cancel()
-
-    def connect(self):
-        return socket.create_connection(('127.0.0.1', self.port))
 
     def test_request_header(self):
         client = AsyncClient()
