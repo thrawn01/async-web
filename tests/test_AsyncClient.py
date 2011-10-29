@@ -15,7 +15,8 @@ MAX_HEADER_LENGTH = 1500
 
 class Response(object):
     
-    def __init__(self, file, version, status, reason, headers):
+    def __init__(self, client, file, version, status, reason, headers):
+        self.client = client
         self.version = version
         self.status = status
         self.reason = reason
@@ -32,7 +33,7 @@ class Response(object):
         except ValueError:
             raise RuntimeError('Invalid value for "Content-Length" header; %s' % headers['content-length'][0])
         except KeyError:
-            # Assume the response is chunked
+            # Missing Content-Length is ok, it might be a chunked response
             pass
 
         for (key,value) in headers.iteritems():
@@ -48,12 +49,39 @@ class Response(object):
         return self.file.read(length)
 
 
-    def readall(self):
+    def readall(self, callback=None):
+        try:
+            # RFC2616 Sec 4.4
+            # If a Transfer-Encoding header field (section 14.41) is present and has any value other than "identity", 
+            # then the transfer-length is defined by use of the "chunked" transfer-coding (section 3.6), 
+            # unless the message is terminated by closing the connection. 
+
+            if self.headers['Transfer-Encoding'] != 'identity':
+                if self.file.closed: # XXX Does a file object know when a socket is closed?
+                    raise KeyError()
+                
+                while True:
+                    # Read chunk header
+                    (length, extensions) = self._chunk_header(self.file)
+                    # Read the chunk
+                    data = self.file.read(length)
+                    # Read the trailer
+                    entity_headers = self.client._header(self.file)
+                    # Run the Call back if one is supplied XXX: Is this how we want todo this?
+                    if call_back:
+                        call_back(data)
+
+                raise RuntimeError("Unknown 'Transfer-Encoding' aborting; %s" % self.headers['Transfer-Encoding'])
+
+        except KeyError:
+            pass
+
         try:
             return self.file.read(self.headers['Content-Length'])
         except KeyError:
-            # XXX Handle chunked read 
-            pass
+            raise RuntimeError("Unable to read response; missing 'Content-Length' header and 'Transfer-Encoding' is not 'chunked'")
+
+        # Check for 'Connection: close' header
 
 
 class AsyncClient(object):
@@ -109,7 +137,7 @@ class AsyncClient(object):
         return (11, status_code, reason_phrase.rstrip())
    
 
-    def _response_header(self, file):
+    def _header(self, file):
         headers = defaultdict(list)
         while True:
             # Read each header should conform to a format of 'key:value\r\n'
@@ -132,9 +160,7 @@ class AsyncClient(object):
                 headers[key.strip()].append(value.strip())
             except ValueError:
                 raise RuntimeError('Malformed header found while parsing server response; %s' % header_line)
-         
-            # XXX If content-length is missing, should we assume chunked? or check for it?
-
+        
 
     def _parse_response(self, sock):
         # Use a file like object so we can use readline()
@@ -142,9 +168,9 @@ class AsyncClient(object):
         # Parse the status line 
         (version, status, reason) = self._status_line(fd)
         # Parse the response headers
-        headers = self._response_header(fd)
+        headers = self._header(fd)
         # Instanciate the user object Response()
-        return Response(fd, version, status, reason, headers)
+        return Response(self, fd, version, status, reason, headers)
 
         
     def get(self, url, timeout=socket._GLOBAL_DEFAULT_TIMEOUT):
@@ -239,31 +265,31 @@ class TestAsyncClient(TestCase):
         self.assertRaises(RuntimeError, client._status_line, StringIO('HTTP/1.1 200 \r\n'))
         self.assertRaises(RuntimeError, client._status_line, StringIO('200 OK\r\n'))
 
-    def test_response_header(self):
+    def test_header(self):
         client = AsyncClient()
         file = StringIO('Content-Type: text/plain\r\nContent-Length: 11\r\nDate: Fri, 28 Oct 2011 18:40:19 GMT\r\n\r\n')
 
-        headers = client._response_header(file)
+        headers = client._header(file)
         self.assertEquals(dict(headers), { 'Content-Type': ['text/plain'],
                                            'Content-Length': ['11'],
                                            'Date': ['Fri, 28 Oct 2011 18:40:19 GMT'] })
 
-    def test_response_raises(self):
+    def test_header_raises(self):
         client = AsyncClient()
 
         # Should raise on long header line ( aka, no \r\n )
         long_header = ''.join([ ' ' for x in range(1,1500) ])
-        self.assertRaises(RuntimeError, client._response_header, StringIO(long_header))
+        self.assertRaises(RuntimeError, client._header, StringIO(long_header))
         
         # Should raise on incorrectly terminated headers
         file = StringIO('Content-Type: text/plain\r\nContent-Length: 11\r\nDate: Fri, 28 Oct 2011 18:40:19 GMT\r\n')
-        self.assertRaises(RuntimeError, client._response_header, file)
+        self.assertRaises(RuntimeError, client._header, file)
         file = StringIO('Content-Type: text/plain\r\nContent-Length: 11\r\nDate: Fri, 28 Oct 2011 18:40:19 GMT')
-        self.assertRaises(RuntimeError, client._response_header, file)
+        self.assertRaises(RuntimeError, client._header, file)
         
         # Should raise on malformed, garbage headers
         file = StringIO('Content-Type- text/plain\r\nContent-LengthASDF#$^@#$G@#G#@%H@#$BH@#$#$')
-        self.assertRaises(RuntimeError, client._response_header, file)
+        self.assertRaises(RuntimeError, client._header, file)
 
 
     def test_connect(self):
@@ -275,7 +301,8 @@ class TestAsyncClient(TestCase):
 class TestResponse(TestCase):
 
     def test_constructor(self):
-        resp = Response(StringIO(''), 11, 200, 'OK', {'Content-Length':['11'], 'Param':['1','2']})
+        
+        resp = Response(AsyncClient, StringIO(''), 11, 200, 'OK', {'Content-Length':['11'], 'Param':['1','2']})
         self.assertEquals(resp.headers, {'Content-Length': 11, 'Param':['1','2']} )
 
 
