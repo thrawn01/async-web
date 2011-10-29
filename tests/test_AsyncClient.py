@@ -6,54 +6,18 @@ from urlparse import urlparse
 from gevent import monkey
 from gevent import socket
 from gevent import pywsgi
+from StringIO import StringIO
+from collections import defaultdict
 import gevent
 import sys
 
-class UrlParse(object):
-    
-    def __init__(self,url):
-        url = urlparse(url)
-        if not 'http' in url[0]:
-            raise RuntimeError("Only (http,https) supported")
-        self.url = url
-
-    def port(self): 
-        port = self.url.port
-        if port:
-            return int(port)
-        return int(80)
-
-    def path(self):
-        val = self.url[2]
-        if val:
-            return val
-        return '/'
-
-    def scheme(self):
-        return self.url[0]
-
-    def host(self): 
-        return self.url.hostname
-
-
+MAX_HEADER_LINE = 1500
 
 class TestUrlParse(TestCase):
    
     def setUp(self):
         self.client = AsyncClient()
-        
-    def test_parse_http(self):
-        (scheme, host, port, path) = self.client.parseURI("http://localhost:1500")
-        self.assertEquals(scheme,'http')
-        self.assertEquals(host,'localhost')
-        self.assertEquals(port,1500)
-        self.assertEquals(path,'/')
 
-    def test_parse_raises(self):
-        client = AsyncClient()
-        self.assertRaises(RuntimeError, self.client.parseURI, ("ftp://localhost:1500"))
-        self.assertRaises(RuntimeError, self.client.parseURI, (""))
-        self.assertRaises(RuntimeError, self.client.parseURI, ("this is not a url"))
 
 
 class AsyncClient(object):
@@ -61,9 +25,11 @@ class AsyncClient(object):
     def __init__(self):
         pass
 
+
     def log(self, msg):
         sys.stderr.write(msg)
-    
+
+
     def parseURI(self, uri):
         url = urlparse(uri)
         port = int(url.port or 80)
@@ -75,10 +41,70 @@ class AsyncClient(object):
 
         return (scheme, url.hostname, port, path)
 
+
     def _request_header(self, method, path='/', headers=(), version='HTTP/1.1'):
         headers = [": ".join(x) for x in headers]
         return "%s %s %s\r\n%s\r\n\r\n" % (method, path, version,"\r\n".join(headers))
 
+
+    def _status_line(self, file):
+        # Read the first line of the response ( should be the status-line )
+        status_line = file.readline(MAX_HEADER_LINE + 1)
+        # If the status-line is larger than the default MTU, it's bogus
+        if len(status_line) > MAX_HEADER_LINE:
+            raise RuntimeError('Refusing to parse extremely long status_line; %s' % status_line )
+
+        try:
+            (http_version, status_code, reason_phrase) = status_line.split(None,2)
+        except ValueError:
+            raise RuntimeError('Invalid HTTP/1.1 status line in response header; %s' % status_line)
+        
+        if http_version != 'HTTP/1.1':
+            raise RuntimeError('Server responded with unsupported HTTP Version; Only HTTP/1.1 supported')
+        
+        try:
+            # Although RFC2616 Only mentions 100 through 505, Extensions could utilize up to 999
+            status_code = int(status_code)
+            if status_code < 100 or status_code > 999:
+                raise ValueError()
+        except ValueError:
+            raise RuntimeError("Invalid status code in HTTP/1.1 status line; %s" % status_line)
+        
+        return (11, status_code, reason_phrase.rstrip())
+   
+
+    def _response_header(self, file):
+        headers = defaultdict(list)
+        while True:
+            # Read each header should conform to a format of 'key:value\r\n'
+            header_line = file.readline(MAX_HEADER_LINE + 1)
+
+            # If the header-line is larger than the default MTU, it's bogus
+            length = len(header_line)
+            if length > MAX_HEADER_LINE:
+                raise RuntimeError('Refusing to parse extremely long header line; %s' % header_line )
+            if length == 0:
+                raise RuntimeError('HTTP header incorrectly terminated; expected "\\r\\n"')
+
+            # Is this the last line in the header?
+            if header_line == '\r\n':
+                return headers
+
+            try:
+                # If the line does not conform to accepted header format, split or the unpack should let us know
+                (key, value) = header_line.split(':', 1)
+                headers[key.strip().lower()].append(value.strip())
+            except ValueError:
+                raise RuntimeError('Malformed header found while parsing server response; %s' % header_line)
+         
+
+    def _parse_response(self, sock):
+        fd = sock.makefile('fb')
+        (version, status, reason) = self._status_line(fd)
+        headers = self._response_header(fd)
+        return fd
+
+        
     def get(self, url, timeout=socket._GLOBAL_DEFAULT_TIMEOUT):
         # Parse the URI
         (scheme, host, port, path) = self.parseURI(url)
@@ -86,7 +112,8 @@ class AsyncClient(object):
         sock = socket.create_connection((host, port), timeout=timeout)
         # Sending the request header
         sock.send(self._request_header('GET', path, (('Host',host),)))
-        return sock
+        # Parse the response and return a Request Object      
+        return self._parse_response(sock)
    
 
 class TestAsyncClient(TestCase):
@@ -96,16 +123,19 @@ class TestAsyncClient(TestCase):
         start_response('200 OK', [('Content-Type', 'text/plain')])
         yield 'hello world'
 
+
     @staticmethod
     def application(env, start_response):
         start_response('200 OK', [('Content-Type', 'text/plain'),('Content-Length', '11')])
         return ['hello world']
+
 
     def setUp(self):
         self.application = validator(self.application)
         self.server = pywsgi.WSGIServer(('127.0.0.1', 15001), self.application)
         self.server.start()
         self.port = self.server.server_port
+
 
     def tearDown(self):
         timeout = gevent.Timeout(0.5,RuntimeError("Timeout trying to stop server"))
@@ -115,15 +145,90 @@ class TestAsyncClient(TestCase):
         finally:
             timeout.cancel()
 
+
+    def test_parse_uri(self):
+        client = AsyncClient()
+        (scheme, host, port, path) = client.parseURI("http://localhost:1500")
+        self.assertEquals(scheme,'http')
+        self.assertEquals(host,'localhost')
+        self.assertEquals(port,1500)
+        self.assertEquals(path,'/')
+
+
+    def test_parse_uri_raises(self):
+        client = AsyncClient()
+        self.assertRaises(RuntimeError, client.parseURI, ("ftp://localhost:1500"))
+        self.assertRaises(RuntimeError, client.parseURI, (""))
+        self.assertRaises(RuntimeError, client.parseURI, ("this is not a url"))
+
+
     def test_request_header(self):
         client = AsyncClient()
         request = client._request_header('GET', path='/', headers=(('Host', 'localhost'),))
         self.assertEquals(request, 'GET / HTTP/1.1\r\nHost: localhost\r\n\r\n')
+
+    def test_status_line(self):
+        client = AsyncClient()
+        (version, status, reason) = client._status_line(StringIO('HTTP/1.1 200 OK\r\n'))
+        self.assertEquals(version, 11)
+        self.assertEquals(status, 200)
+        self.assertEquals(reason, 'OK')
+
+    def test_status_line_raises(self):
+        client = AsyncClient()
+
+        # Should raise on long status line
+        long_line = ''.join([ ' ' for x in range(1,1500) ])
+        self.assertRaises(RuntimeError, client._status_line, StringIO(long_line))
         
+        # Should raise on garbage status lines
+        self.assertRaises(RuntimeError, client._status_line, StringIO('HTTP/1.1-200-OK\r\n'))
+        self.assertRaises(RuntimeError, client._status_line, StringIO('blahblah'))
+    
+        # Should raise on wrong HTTP version
+        self.assertRaises(RuntimeError, client._status_line, StringIO('HTTP/1.0 200 OK\r\n'))
+        self.assertRaises(RuntimeError, client._status_line, StringIO('HTTP/0.9 200 OK\r\n'))
+        
+        # Should raise on invalid status code
+        self.assertRaises(RuntimeError, client._status_line, StringIO('HTTP/1.1 2001 OK\r\n'))
+        self.assertRaises(RuntimeError, client._status_line, StringIO('HTTP/1.1 000 UhOh\r\n'))
+
+        # Should raise on missing values
+        self.assertRaises(RuntimeError, client._status_line, StringIO('HTTP/1.1 200 \r\n'))
+        self.assertRaises(RuntimeError, client._status_line, StringIO('200 OK\r\n'))
+
+    def test_response_header(self):
+        client = AsyncClient()
+        file = StringIO('Content-Type: text/plain\r\nContent-Length: 11\r\nDate: Fri, 28 Oct 2011 18:40:19 GMT\r\n\r\n')
+
+        headers = client._response_header(file)
+        self.assertEquals(dict(headers), { 'content-type': ['text/plain'],
+                                           'content-length': ['11'],
+                                           'date': ['Fri, 28 Oct 2011 18:40:19 GMT'] })
+
+    def test_response_raises(self):
+        client = AsyncClient()
+
+        # Should raise on long header line ( aka, no \r\n )
+        long_header = ''.join([ ' ' for x in range(1,1500) ])
+        self.assertRaises(RuntimeError, client._response_header, StringIO(long_header))
+        
+        # Should raise on incorrectly terminated headers
+        file = StringIO('Content-Type: text/plain\r\nContent-Length: 11\r\nDate: Fri, 28 Oct 2011 18:40:19 GMT\r\n')
+        self.assertRaises(RuntimeError, client._response_header, file)
+        file = StringIO('Content-Type: text/plain\r\nContent-Length: 11\r\nDate: Fri, 28 Oct 2011 18:40:19 GMT')
+        self.assertRaises(RuntimeError, client._response_header, file)
+        
+        # Should raise on malformed, garbage headers
+        file = StringIO('Content-Type- text/plain\r\nContent-LengthASDF#$^@#$G@#G#@%H@#$BH@#$#$')
+        self.assertRaises(RuntimeError, client._response_header, file)
+
+
     def test_connect(self):
-        sock = AsyncClient().get('http://127.0.0.1:15001/')
-        #print request.read()
+        fd = AsyncClient().get('http://127.0.0.1:15001/')
+        print fd.read(11)
 
         #sock.send('GET / HTTP/1.1\r\nHost: localhost\r\n\r\n')
-        print sock.recv(1500)
+        #fd = sock.makefile('rb')
+        #print fd.readline(1500), fd.readline(1500), fd.readline(1500), fd.readline(1500)
 
