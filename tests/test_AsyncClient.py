@@ -11,13 +11,49 @@ from collections import defaultdict
 import gevent
 import sys
 
-MAX_HEADER_LINE = 1500
+MAX_HEADER_LENGTH = 1500
 
-class TestUrlParse(TestCase):
-   
-    def setUp(self):
-        self.client = AsyncClient()
+class Response(object):
+    
+    def __init__(self, file, version, status, reason, headers):
+        self.version = version
+        self.status = status
+        self.reason = reason
+        self.headers = self._normalizeHeaders(headers)
+        self.file = file
 
+
+    def _normalizeHeaders(self,headers):
+        new_headers = {}
+
+        try:
+            new_headers['Content-Length'] = int(headers['Content-Length'][0])
+            del headers['Content-Length']
+        except ValueError:
+            raise RuntimeError('Invalid value for "Content-Length" header; %s' % headers['content-length'][0])
+        except KeyError:
+            # Assume the response is chunked
+            pass
+
+        for (key,value) in headers.iteritems():
+            if len(value) > 1:
+                new_headers[key] = value
+                continue
+            new_headers[key] = value[0]
+        
+        return new_headers
+
+
+    def read(self,length):
+        return self.file.read(length)
+
+
+    def readall(self):
+        try:
+            return self.file.read(self.headers['Content-Length'])
+        except KeyError:
+            # XXX Handle chunked read 
+            pass
 
 
 class AsyncClient(object):
@@ -30,7 +66,7 @@ class AsyncClient(object):
         sys.stderr.write(msg)
 
 
-    def parseURI(self, uri):
+    def parse_uri(self, uri):
         url = urlparse(uri)
         port = int(url.port or 80)
         path = url.path or '/'
@@ -49,9 +85,9 @@ class AsyncClient(object):
 
     def _status_line(self, file):
         # Read the first line of the response ( should be the status-line )
-        status_line = file.readline(MAX_HEADER_LINE + 1)
+        status_line = file.readline(MAX_HEADER_LENGTH + 1)
         # If the status-line is larger than the default MTU, it's bogus
-        if len(status_line) > MAX_HEADER_LINE:
+        if len(status_line) > MAX_HEADER_LENGTH:
             raise RuntimeError('Refusing to parse extremely long status_line; %s' % status_line )
 
         try:
@@ -77,11 +113,11 @@ class AsyncClient(object):
         headers = defaultdict(list)
         while True:
             # Read each header should conform to a format of 'key:value\r\n'
-            header_line = file.readline(MAX_HEADER_LINE + 1)
+            header_line = file.readline(MAX_HEADER_LENGTH + 1)
 
             # If the header-line is larger than the default MTU, it's bogus
             length = len(header_line)
-            if length > MAX_HEADER_LINE:
+            if length > MAX_HEADER_LENGTH:
                 raise RuntimeError('Refusing to parse extremely long header line; %s' % header_line )
             if length == 0:
                 raise RuntimeError('HTTP header incorrectly terminated; expected "\\r\\n"')
@@ -93,24 +129,30 @@ class AsyncClient(object):
             try:
                 # If the line does not conform to accepted header format, split or the unpack should let us know
                 (key, value) = header_line.split(':', 1)
-                headers[key.strip().lower()].append(value.strip())
+                headers[key.strip()].append(value.strip())
             except ValueError:
                 raise RuntimeError('Malformed header found while parsing server response; %s' % header_line)
          
+            # XXX If content-length is missing, should we assume chunked? or check for it?
+
 
     def _parse_response(self, sock):
+        # Use a file like object so we can use readline()
         fd = sock.makefile('fb')
+        # Parse the status line 
         (version, status, reason) = self._status_line(fd)
+        # Parse the response headers
         headers = self._response_header(fd)
-        return fd
+        # Instanciate the user object Response()
+        return Response(fd, version, status, reason, headers)
 
         
     def get(self, url, timeout=socket._GLOBAL_DEFAULT_TIMEOUT):
         # Parse the URI
-        (scheme, host, port, path) = self.parseURI(url)
+        (scheme, host, port, path) = self.parse_uri(url)
         # Connect to the remote Host
         sock = socket.create_connection((host, port), timeout=timeout)
-        # Sending the request header
+        # Send the request header
         sock.send(self._request_header('GET', path, (('Host',host),)))
         # Parse the response and return a Request Object      
         return self._parse_response(sock)
@@ -148,7 +190,7 @@ class TestAsyncClient(TestCase):
 
     def test_parse_uri(self):
         client = AsyncClient()
-        (scheme, host, port, path) = client.parseURI("http://localhost:1500")
+        (scheme, host, port, path) = client.parse_uri("http://localhost:1500")
         self.assertEquals(scheme,'http')
         self.assertEquals(host,'localhost')
         self.assertEquals(port,1500)
@@ -157,9 +199,9 @@ class TestAsyncClient(TestCase):
 
     def test_parse_uri_raises(self):
         client = AsyncClient()
-        self.assertRaises(RuntimeError, client.parseURI, ("ftp://localhost:1500"))
-        self.assertRaises(RuntimeError, client.parseURI, (""))
-        self.assertRaises(RuntimeError, client.parseURI, ("this is not a url"))
+        self.assertRaises(RuntimeError, client.parse_uri, ("ftp://localhost:1500"))
+        self.assertRaises(RuntimeError, client.parse_uri, (""))
+        self.assertRaises(RuntimeError, client.parse_uri, ("this is not a url"))
 
 
     def test_request_header(self):
@@ -202,9 +244,9 @@ class TestAsyncClient(TestCase):
         file = StringIO('Content-Type: text/plain\r\nContent-Length: 11\r\nDate: Fri, 28 Oct 2011 18:40:19 GMT\r\n\r\n')
 
         headers = client._response_header(file)
-        self.assertEquals(dict(headers), { 'content-type': ['text/plain'],
-                                           'content-length': ['11'],
-                                           'date': ['Fri, 28 Oct 2011 18:40:19 GMT'] })
+        self.assertEquals(dict(headers), { 'Content-Type': ['text/plain'],
+                                           'Content-Length': ['11'],
+                                           'Date': ['Fri, 28 Oct 2011 18:40:19 GMT'] })
 
     def test_response_raises(self):
         client = AsyncClient()
@@ -225,10 +267,15 @@ class TestAsyncClient(TestCase):
 
 
     def test_connect(self):
-        fd = AsyncClient().get('http://127.0.0.1:15001/')
-        print fd.read(11)
+        resp = AsyncClient().get('http://127.0.0.1:15001/')
+        print resp.readall()
 
-        #sock.send('GET / HTTP/1.1\r\nHost: localhost\r\n\r\n')
-        #fd = sock.makefile('rb')
-        #print fd.readline(1500), fd.readline(1500), fd.readline(1500), fd.readline(1500)
+
+
+class TestResponse(TestCase):
+
+    def test_constructor(self):
+        resp = Response(StringIO(''), 11, 200, 'OK', {'Content-Length':['11'], 'Param':['1','2']})
+        self.assertEquals(resp.headers, {'Content-Length': 11, 'Param':['1','2']} )
+
 
