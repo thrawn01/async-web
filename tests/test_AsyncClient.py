@@ -13,10 +13,46 @@ import sys
 
 MAX_HEADER_LENGTH = 1500
 
+def parse_header(file):
+    headers = {}
+    while True:
+        # Read each header should conform to a format of 'key:value\r\n'
+        header_line = file.readline(MAX_HEADER_LENGTH + 1)
+
+        # If the header-line is larger than the default MTU, it's bogus
+        length = len(header_line)
+        if length > MAX_HEADER_LENGTH:
+            raise RuntimeError('Refusing to parse extremely long header line; %s' % header_line )
+        if length == 0:
+            raise RuntimeError('HTTP header incorrectly terminated; expected "\\r\\n"')
+
+        # Is this the last line in the header?
+        if header_line == '\r\n':
+            return headers
+
+        try:
+            # If the line does not conform to accepted header format, split or the unpack should let us know
+            (key, value) = header_line.split(':', 1)
+        except ValueError:
+            raise RuntimeError('Malformed header found; %s' % header_line)
+        
+        # Strip the white space around the key and value
+        key = key.strip(); value = value.strip()
+
+        # This doesn't seam performant but is. See Commit 3fa292cf and 38b8c18e8
+        if key in headers:
+            if isinstance(headers[key], list):
+                headers[key].append(value)
+            else:
+                headers[key] = [headers[key], value]
+        else:
+            headers[key] = value
+
+    return headers
+
 class Response(object):
     
-    def __init__(self, client, file, version, status, reason, headers):
-        self.client = client
+    def __init__(self, file, version, status, reason, headers):
         self.version = version
         self.status = status
         self.reason = reason
@@ -25,24 +61,15 @@ class Response(object):
 
 
     def _normalizeHeaders(self,headers):
-        new_headers = {}
-
         try:
-            new_headers['Content-Length'] = int(headers['Content-Length'][0])
-            del headers['Content-Length']
+            headers['Content-Length'] = int(headers['Content-Length'])
         except ValueError:
             raise RuntimeError('Invalid value for "Content-Length" header; %s' % headers['content-length'][0])
         except KeyError:
             # Missing Content-Length is ok, it might be a chunked response
             pass
-
-        for (key,value) in headers.iteritems():
-            if len(value) > 1:
-                new_headers[key] = value
-                continue
-            new_headers[key] = value[0]
         
-        return new_headers
+        return headers
 
 
     def read(self,length):
@@ -55,7 +82,6 @@ class Response(object):
             # If a Transfer-Encoding header field (section 14.41) is present and has any value other than "identity", 
             # then the transfer-length is defined by use of the "chunked" transfer-coding (section 3.6), 
             # unless the message is terminated by closing the connection. 
-
             if self.headers['Transfer-Encoding'] != 'identity':
                 if self.file.closed: # XXX Does a file object know when a socket is closed?
                     raise KeyError()
@@ -66,7 +92,7 @@ class Response(object):
                     # Read the chunk
                     data = self.file.read(length)
                     # Read the trailer
-                    entity_headers = self.client._header(self.file)
+                    entity_headers = parse_header(self.file)
                     # Run the Call back if one is supplied XXX: Is this how we want todo this?
                     if call_back:
                         call_back(data)
@@ -137,53 +163,15 @@ class AsyncClient(object):
         return (11, status_code, reason_phrase.rstrip())
    
 
-    def _header(self, file):
-        headers = {}
-        while True:
-            # Read each header should conform to a format of 'key:value\r\n'
-            header_line = file.readline(MAX_HEADER_LENGTH + 1)
-
-            # If the header-line is larger than the default MTU, it's bogus
-            length = len(header_line)
-            if length > MAX_HEADER_LENGTH:
-                raise RuntimeError('Refusing to parse extremely long header line; %s' % header_line )
-            if length == 0:
-                raise RuntimeError('HTTP header incorrectly terminated; expected "\\r\\n"')
-
-            # Is this the last line in the header?
-            if header_line == '\r\n':
-                return headers
-
-            try:
-                # If the line does not conform to accepted header format, split or the unpack should let us know
-                (key, value) = header_line.split(':', 1)
-            except ValueError:
-                raise RuntimeError('Malformed header found while parsing server response; %s' % header_line)
-            
-            # Strip the white space around the key and value
-            key = key.strip(); value = value.strip()
-
-            try:
-                # Attempt to append the value to a list for this key
-                headers[key].append(value)
-            except AttributeError:
-                # If we get AttributeError then the key exists, but value isn't a list
-                headers[key] = [headers[key], value]
-            except KeyError:
-                # If we get a KeyError then the key doesn't exist in the dict, Add it
-                headers[key] = value
-
-        return headers
-
     def _parse_response(self, sock):
         # Use a file like object so we can use readline()
         fd = sock.makefile('fb')
         # Parse the status line 
         (version, status, reason) = self._status_line(fd)
         # Parse the response headers
-        headers = self._header(fd)
+        headers = parse_header(fd)
         # Instanciate the user object Response()
-        return Response(self, fd, version, status, reason, headers)
+        return Response(fd, version, status, reason, headers)
 
         
     def get(self, url, timeout=socket._GLOBAL_DEFAULT_TIMEOUT):
@@ -278,31 +266,29 @@ class TestAsyncClient(TestCase):
         self.assertRaises(RuntimeError, client._status_line, StringIO('HTTP/1.1 200 \r\n'))
         self.assertRaises(RuntimeError, client._status_line, StringIO('200 OK\r\n'))
 
-    def test_header(self):
-        client = AsyncClient()
+    def test_parse_header(self):
         file = StringIO('Content-Type: text/plain\r\nContent-Length: 11\r\nDate: Fri, 28 Oct 2011 18:40:19 GMT\r\n\r\n')
 
-        headers = client._header(file)
-        self.assertEquals(dict(headers), { 'Content-Type': ['text/plain'],
-                                           'Content-Length': ['11'],
-                                           'Date': ['Fri, 28 Oct 2011 18:40:19 GMT'] })
+        headers = parse_header(file)
+        self.assertEquals(dict(headers), { 'Content-Type': 'text/plain',
+                                           'Content-Length': '11',
+                                           'Date': 'Fri, 28 Oct 2011 18:40:19 GMT' })
 
-    def test_header_raises(self):
-        client = AsyncClient()
+    def test_parse_header_raises(self):
 
         # Should raise on long header line ( aka, no \r\n )
         long_header = ''.join([ ' ' for x in range(1,1500) ])
-        self.assertRaises(RuntimeError, client._header, StringIO(long_header))
+        self.assertRaises(RuntimeError, parse_header, StringIO(long_header))
         
         # Should raise on incorrectly terminated headers
         file = StringIO('Content-Type: text/plain\r\nContent-Length: 11\r\nDate: Fri, 28 Oct 2011 18:40:19 GMT\r\n')
-        self.assertRaises(RuntimeError, client._header, file)
+        self.assertRaises(RuntimeError, parse_header, file)
         file = StringIO('Content-Type: text/plain\r\nContent-Length: 11\r\nDate: Fri, 28 Oct 2011 18:40:19 GMT')
-        self.assertRaises(RuntimeError, client._header, file)
+        self.assertRaises(RuntimeError, parse_header, file)
         
         # Should raise on malformed, garbage headers
         file = StringIO('Content-Type- text/plain\r\nContent-LengthASDF#$^@#$G@#G#@%H@#$BH@#$#$')
-        self.assertRaises(RuntimeError, client._header, file)
+        self.assertRaises(RuntimeError, parse_header, file)
 
 
     def test_connect(self):
@@ -315,89 +301,6 @@ class TestResponse(TestCase):
 
     def test_constructor(self):
         
-        resp = Response(AsyncClient, StringIO(''), 11, 200, 'OK', {'Content-Length':['11'], 'Param':['1','2']})
+        resp = Response(StringIO(''), 11, 200, 'OK', {'Content-Length':'11', 'Param':['1','2']})
         self.assertEquals(resp.headers, {'Content-Length': 11, 'Param':['1','2']} )
-
-
-def header_slow(file):
-    headers = {}
-    while True:
-        # Read each header should conform to a format of 'key:value\r\n'
-        header_line = file.readline(1500)
-
-        # Is this the last line in the header?
-        if header_line == '\r\n':
-            return headers
-
-        try:
-            # If the line does not conform to accepted header format, split or the unpack should let us know
-            (key, value) = header_line.split(':', 1)
-        except ValueError:
-            raise RuntimeError('Malformed header found while parsing server response; %s' % header_line)
-        
-        # Strip the white space around the key and value
-        key = key.strip(); value = value.strip()
-
-        try:
-            # Attempt to append the value to a list for this key
-            headers[key].append(value)
-        except AttributeError:
-            # If we get AttributeError then the value does exist, but value isn't a list
-            headers[key] = [headers[key], value]
-        except KeyError:
-            # If we get a KeyError then the key doesn't exist in the dict, Add it
-            headers[key] = value
-
-    return headers
-
-
-def header_fast(file):
-    headers = {}
-    while True:
-        # Read each header should conform to a format of 'key:value\r\n'
-        header_line = file.readline(1500)
-
-        # Is this the last line in the header?
-        if header_line == '\r\n':
-            return headers
-
-        try:
-            # If the line does not conform to accepted header format, split or the unpack should let us know
-            (key, value) = header_line.split(':', 1)
-        except ValueError:
-            raise RuntimeError('Malformed header found while parsing server response; %s' % header_line)
-       
-        # Strip the white space around the key and value
-        key = key.strip(); value = value.strip()
-
-        if key in headers:
-            if isinstance(headers[key], list):
-                headers[key].append(value)
-            else:
-                headers[key] = [headers[key], value]
-        else:
-            headers[key] = value
-            
-    return headers
-
-if __name__ == '__main__':
-    headers = {}
-    
-    # What did we learn today class?
-    # Throwing exceptions is slower than calling isinstance()
-    # The "pythonic" way of handling this situation is not fast ( This makes me sad )
-
-    # XXX Lession Learned, If it is likely to pass, use try/except it's more performant
-    # However, if it's likely to always throw, use 'isinstance'
-
-    for i in range(1,1000000):
-        file = StringIO('Content-Type: text/plain\r\nContent-Length: 11\r\nParam: value1\r\nParam: value2\r\nParam: value3\r\n\r\n')
-        #headers = header_fast(file)
-        headers = header_slow(file)
-
-    if headers == {'Content-Type': 'text/plain', 'Content-Length': '11', 'Param':['value1','value2', 'value3']}:
-        print "OK", headers
-    else:
-        print "ERROR", headers
-
 
