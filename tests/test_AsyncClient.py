@@ -138,7 +138,7 @@ class AsyncClient(object):
    
 
     def _header(self, file):
-        headers = defaultdict(list)
+        headers = {}
         while True:
             # Read each header should conform to a format of 'key:value\r\n'
             header_line = file.readline(MAX_HEADER_LENGTH + 1)
@@ -157,10 +157,23 @@ class AsyncClient(object):
             try:
                 # If the line does not conform to accepted header format, split or the unpack should let us know
                 (key, value) = header_line.split(':', 1)
-                headers[key.strip()].append(value.strip())
             except ValueError:
                 raise RuntimeError('Malformed header found while parsing server response; %s' % header_line)
-        
+            
+            # Strip the white space around the key and value
+            key = key.strip(); value = value.strip()
+
+            try:
+                # Attempt to append the value to a list for this key
+                headers[key].append(value)
+            except AttributeError:
+                # If we get AttributeError then the key exists, but value isn't a list
+                headers[key] = [headers[key], value]
+            except KeyError:
+                # If we get a KeyError then the key doesn't exist in the dict, Add it
+                headers[key] = value
+
+        return headers
 
     def _parse_response(self, sock):
         # Use a file like object so we can use readline()
@@ -304,5 +317,84 @@ class TestResponse(TestCase):
         
         resp = Response(AsyncClient, StringIO(''), 11, 200, 'OK', {'Content-Length':['11'], 'Param':['1','2']})
         self.assertEquals(resp.headers, {'Content-Length': 11, 'Param':['1','2']} )
+
+
+def header_slow(file):
+    headers = {}
+    while True:
+        # Read each header should conform to a format of 'key:value\r\n'
+        header_line = file.readline(1500)
+
+        # Is this the last line in the header?
+        if header_line == '\r\n':
+            return headers
+
+        try:
+            # If the line does not conform to accepted header format, split or the unpack should let us know
+            (key, value) = header_line.split(':', 1)
+        except ValueError:
+            raise RuntimeError('Malformed header found while parsing server response; %s' % header_line)
+        
+        # Strip the white space around the key and value
+        key = key.strip(); value = value.strip()
+
+        try:
+            # Attempt to append the value to a list for this key
+            headers[key].append(value)
+        except AttributeError:
+            # If we get AttributeError then the value does exist, but value isn't a list
+            headers[key] = [headers[key], value]
+        except KeyError:
+            # If we get a KeyError then the key doesn't exist in the dict, Add it
+            headers[key] = value
+
+    return headers
+
+
+def header_fast(file):
+    headers = {}
+    while True:
+        # Read each header should conform to a format of 'key:value\r\n'
+        header_line = file.readline(1500)
+
+        # Is this the last line in the header?
+        if header_line == '\r\n':
+            return headers
+
+        try:
+            # If the line does not conform to accepted header format, split or the unpack should let us know
+            (key, value) = header_line.split(':', 1)
+        except ValueError:
+            raise RuntimeError('Malformed header found while parsing server response; %s' % header_line)
+       
+        # Strip the white space around the key and value
+        key = key.strip(); value = value.strip()
+
+        if key in headers:
+            if isinstance(headers[key], list):
+                headers[key].append(value)
+            else:
+                headers[key] = [headers[key], value]
+        else:
+            headers[key] = value
+            
+    return headers
+
+if __name__ == '__main__':
+    headers = {}
+    
+    # What did we learn today class?
+    # Throwing exceptions is slower than calling isinstance()
+    # The "pythonic" way of handling this situation is not fast ( This makes me sad )
+
+    for i in range(1,1000000):
+        file = StringIO('Content-Type: text/plain\r\nContent-Length: 11\r\nParam: value1\r\nParam: value2\r\nParam: value3\r\n\r\n')
+        #headers = header_fast(file)
+        headers = header_slow(file)
+
+    if headers == {'Content-Type': 'text/plain', 'Content-Length': '11', 'Param':['value1','value2', 'value3']}:
+        print "OK", headers
+    else:
+        print "ERROR", headers
 
 
