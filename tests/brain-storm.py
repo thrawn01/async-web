@@ -43,8 +43,12 @@ AsyncServer( (OAuth('/'), JSON('/'), Routes(Demo()) ) ).startServer(8080)
 
 # Http Client 
 class Client():
+
+    @client()
+    def __init(self):
+        return (OAuth('/'))
    
-    @client('GET', url='http://www.google.com', filters=())
+    @client('GET', url='http://www.google.com')
     def getGoogle(request, response):
         # Prints out the google page
         print request.read()
