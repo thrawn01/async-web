@@ -387,6 +387,9 @@ if __name__ == '__main__':
     # Throwing exceptions is slower than calling isinstance()
     # The "pythonic" way of handling this situation is not fast ( This makes me sad )
 
+    # XXX Lession Learned, If it is likely to pass, use try/except it's more performant
+    # However, if it's likely to always throw, use 'isinstance'
+
     for i in range(1,1000000):
         file = StringIO('Content-Type: text/plain\r\nContent-Length: 11\r\nParam: value1\r\nParam: value2\r\nParam: value3\r\n\r\n')
         #headers = header_fast(file)
