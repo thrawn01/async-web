@@ -11,17 +11,17 @@ from collections import defaultdict
 import gevent
 import sys
 
-MAX_HEADER_LENGTH = 1500
+MAX_LINE_LENGTH = 1500
 
 def parse_header(file):
     headers = {}
     while True:
         # Read each header should conform to a format of 'key:value\r\n'
-        header_line = file.readline(MAX_HEADER_LENGTH + 1)
+        header_line = file.readline(MAX_LINE_LENGTH + 1)
 
         # If the header-line is larger than the default MTU, it's bogus
         length = len(header_line)
-        if length > MAX_HEADER_LENGTH:
+        if length > MAX_LINE_LENGTH:
             raise RuntimeError('Refusing to parse extremely long header line; %s' % header_line )
         if length == 0:
             raise RuntimeError('HTTP header incorrectly terminated; expected "\\r\\n"')
@@ -72,11 +72,27 @@ class Response(object):
         return headers
 
 
-    def read(self,length):
-        return self.file.read(length)
+    def _chunk_header(self, file):
+        # Read the chunk header line
+        line = file.readline(MAX_LINE_LENGTH + 1)
+        # If the status-line is larger than the default MTU, it's bogus
+        if len(line) > MAX_LINE_LENGTH:
+            raise RuntimeError('Refusing to parse extremely long chunk-header; %s' % line )
+
+        # Split out the header and the extension if it exists
+        header = line.split(';')
+        try:
+            # Interpret the length in HEX
+            header[0] = int(header[0], 16)
+        except KeyError, ValueError:
+            raise RuntimeError("Expected hexdecimal length while reading chunk header; %s" % line)
+       
+        return header
 
 
-    def readall(self, callback=None):
+    def read(self, callback=None):
+        # XXX: Check for values to read, don't want to block if the user calls us again
+
         try:
             # RFC2616 Sec 4.4
             # If a Transfer-Encoding header field (section 14.41) is present and has any value other than "identity", 
@@ -84,21 +100,26 @@ class Response(object):
             # unless the message is terminated by closing the connection. 
             if self.headers['Transfer-Encoding'] != 'identity':
                 if self.file.closed: # XXX Does a file object know when a socket is closed?
-                    raise KeyError()
-                
-                while True:
+                    raise KeyError() # Forces a non-chunked read
+
+                result = []
+                while True: 
                     # Read chunk header
-                    (length, extensions) = self._chunk_header(self.file)
+                    chunked_header = self._chunk_header(self.file)
                     # Read the chunk
-                    data = self.file.read(length)
+                    payload = self.file.read(chunked_header[0])
                     # Read the trailer
-                    entity_headers = parse_header(self.file)
-                    # Run the Call back if one is supplied XXX: Is this how we want todo this?
-                    if call_back:
-                        call_back(data)
+                    chunked_trailer = parse_header(self.file)
+                    # Run the Call back if one is supplied
+                    if callback:
+                        payload = callback(self.headers, chunked_header, chunked_trailer, payload )
+                    else:
+                        result.append(payload)
 
-                raise RuntimeError("Unknown 'Transfer-Encoding' aborting; %s" % self.headers['Transfer-Encoding'])
-
+                    # If no more data in the chunked response
+                    if len(payload) == 0:
+                        return ''.join(result)
+                    
         except KeyError:
             pass
 
@@ -107,8 +128,8 @@ class Response(object):
         except KeyError:
             raise RuntimeError("Unable to read response; missing 'Content-Length' header and 'Transfer-Encoding' is not 'chunked'")
 
-        # Check for 'Connection: close' header
-
+        # XXX: Check for 'Connection: close' header if it exists, close the connection here
+    
 
 class AsyncClient(object):
     
@@ -139,15 +160,15 @@ class AsyncClient(object):
 
     def _status_line(self, file):
         # Read the first line of the response ( should be the status-line )
-        status_line = file.readline(MAX_HEADER_LENGTH + 1)
+        line = file.readline(MAX_LINE_LENGTH + 1)
         # If the status-line is larger than the default MTU, it's bogus
-        if len(status_line) > MAX_HEADER_LENGTH:
-            raise RuntimeError('Refusing to parse extremely long status_line; %s' % status_line )
+        if len(line) > MAX_LINE_LENGTH:
+            raise RuntimeError('Refusing to parse extremely long status-line; %s' % line )
 
         try:
-            (http_version, status_code, reason_phrase) = status_line.split(None,2)
+            (http_version, status_code, reason_phrase) = line.split(None,2)
         except ValueError:
-            raise RuntimeError('Invalid HTTP/1.1 status line in response header; %s' % status_line)
+            raise RuntimeError('Invalid HTTP/1.1 status line in response header; %s' % line)
         
         if http_version != 'HTTP/1.1':
             raise RuntimeError('Server responded with unsupported HTTP Version; Only HTTP/1.1 supported')
@@ -158,7 +179,7 @@ class AsyncClient(object):
             if status_code < 100 or status_code > 999:
                 raise ValueError()
         except ValueError:
-            raise RuntimeError("Invalid status code in HTTP/1.1 status line; %s" % status_line)
+            raise RuntimeError("Invalid status code in HTTP/1.1 status line; %s" % line)
         
         return (11, status_code, reason_phrase.rstrip())
    
@@ -200,7 +221,7 @@ class TestAsyncClient(TestCase):
 
 
     def setUp(self):
-        self.application = validator(self.application)
+        self.application = validator(self.chunked_app)
         self.server = pywsgi.WSGIServer(('127.0.0.1', 15001), self.application)
         self.server.start()
         self.port = self.server.server_port
@@ -293,7 +314,7 @@ class TestAsyncClient(TestCase):
 
     def test_connect(self):
         resp = AsyncClient().get('http://127.0.0.1:15001/')
-        print resp.readall()
+        print resp.read()
 
 
 
