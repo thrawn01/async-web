@@ -372,17 +372,17 @@ class TestResponse(TestCase):
     
 class TestFilter1(Filter):
     def __call__(self, socket, address, filter):
-        print "TestFilter1"
+        #print "TestFilter1"
         return self._next(filter)(socket,address,filter)
 
 class TestFilter2(Filter):
     def __call__(self, socket, address, filter):
-        print "TestFilter2"
+        #print "TestFilter2"
         return self._next(filter)(socket,address,filter)
 
 
 def test_filter1(socket, address, filter):
-    print "Test Filter1"
+    #print "Test Filter1"
     try:
         return next(filter)(socket,address,filter)
     except StopIteration:
@@ -390,7 +390,7 @@ def test_filter1(socket, address, filter):
         
 
 def test_filter2(socket, address, filter):
-    print "Test Filter2"
+    #print "Test Filter2"
     try:
         return next(filter)(socket,address,filter)
     except StopIteration:
@@ -398,22 +398,30 @@ def test_filter2(socket, address, filter):
 
 
 def example1(socket, address, _next):
-    print "example1"
+    #print "example1"
     return _next(socket, address)
     
 def example2(socket, address, _next):
-    print "example2"
+    #print "example2"
     return _next(socket, address)
 
 
 if __name__ == "__main__":
-    # Test with functions
-    server = AsyncServer(('localhost', 'port'), filters=(test_filter1,test_filter2))
-    print server.handle('socket', 'address')
+    # ===== FASTEST ======
+    #server = AsyncServer(('localhost', 'port'), filters=(test_filter1,test_filter2))
+    #for i in range(1, 10000000):
+        #result = server.handle('socket', 'address')
+    #print result
 
-    server = AsyncServer(('localhost', 'port'), filters=(TestFilter1(),TestFilter2()))
-    print server.handle('socket2', 'address2')
+    # ===== SLOWER ======
+    #server = AsyncServer(('localhost', 'port'), filters=(TestFilter1(),TestFilter2()))
+    #for i in range(1, 10000000):
+        #result = server.handle('socket2', 'address2')
+    #print result
 
+    # ===== SLOWEST ======
     server = FilterExample(('localhost', 'port'), filters=(example1,example2))
-    print server.handle('socket3', 'address3')
+    for i in range(1, 10000000):
+        result = server.handle('socket3', 'address3')
+    print result
     
