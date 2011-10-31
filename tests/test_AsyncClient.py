@@ -6,6 +6,7 @@ from urlparse import urlparse
 from gevent import monkey
 from gevent import socket
 from gevent import pywsgi
+from gevent.server import StreamServer
 from StringIO import StringIO
 from collections import defaultdict
 import gevent
@@ -49,6 +50,26 @@ def parse_header(file):
             headers[key] = value
 
     return headers
+
+    
+    
+
+class AsyncServer(StreamServer):
+
+    def __init__(self, listener, filters=None, config=None):
+        self._filters = filters
+        pass
+        # XXX: Basic listener for now, will add SSL and optional args later via config
+        #StreamServer.__init__(self, listener)
+
+    def filters(self, _filters):
+        for _filter in _filters:
+            yield _filter
+
+    def handle(self, socket, address):
+        filter = self.filters(self._filters) 
+        return next(filter)(socket, address, filter)
+
 
 class Response(object):
     
@@ -324,4 +345,20 @@ class TestResponse(TestCase):
         
         resp = Response(StringIO(''), 11, 200, 'OK', {'Content-Length':'11', 'Param':['1','2']})
         self.assertEquals(resp.headers, {'Content-Length': 11, 'Param':['1','2']} )
+
+
+def test_filter1(socket, address, filter):
+    print "Test Filter1"
+    return next(filter)(socket,address,filter)
+
+def test_filter2(socket, address, filter):
+    print "Test Filter2"
+    try:
+        return next(filter)(socket,address,filter)
+    except StopIteration:
+        pass
+
+if __name__ == "__main__":
+    server = AsyncServer(('localhost', 'port'), filters=(test_filter1,test_filter2))
+    print server.handle('socket', 'address')
 
