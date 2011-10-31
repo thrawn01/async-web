@@ -52,7 +52,14 @@ def parse_header(file):
     return headers
 
     
+class Filter(object):
     
+    def _next(self, iterator):
+        try:
+            return next(iterator)
+        except StopIteration:
+            return lambda socket, address, filter: (socket,address)
+
 
 class AsyncServer(StreamServer):
 
@@ -62,13 +69,17 @@ class AsyncServer(StreamServer):
         # XXX: Basic listener for now, will add SSL and optional args later via config
         #StreamServer.__init__(self, listener)
 
+
     def filters(self, _filters):
         for _filter in _filters:
             yield _filter
 
     def handle(self, socket, address):
         filter = self.filters(self._filters) 
-        return next(filter)(socket, address, filter)
+        try:
+            return next(filter)(socket, address, filter)
+        except StopIteration:
+            raise RuntimeError("XXX: No filters defined")
 
 
 class Response(object):
@@ -346,19 +357,38 @@ class TestResponse(TestCase):
         resp = Response(StringIO(''), 11, 200, 'OK', {'Content-Length':'11', 'Param':['1','2']})
         self.assertEquals(resp.headers, {'Content-Length': 11, 'Param':['1','2']} )
 
+    
+class TestFilter1(Filter):
+    def __call__(self, socket, address, filter):
+        print "TestFilter1"
+        return self._next(filter)(socket,address,filter)
+
+class TestFilter2(Filter):
+    def __call__(self, socket, address, filter):
+        print "TestFilter2"
+        return self._next(filter)(socket,address,filter)
+
 
 def test_filter1(socket, address, filter):
     print "Test Filter1"
-    return next(filter)(socket,address,filter)
+    try:
+        return next(filter)(socket,address,filter)
+    except StopIteration:
+        return (socket,address)
+        
 
 def test_filter2(socket, address, filter):
     print "Test Filter2"
     try:
         return next(filter)(socket,address,filter)
     except StopIteration:
-        pass
+        return (socket,address)
 
 if __name__ == "__main__":
+    # Test with functions
     server = AsyncServer(('localhost', 'port'), filters=(test_filter1,test_filter2))
     print server.handle('socket', 'address')
+
+    server = AsyncServer(('localhost', 'port'), filters=(TestFilter1(),TestFilter2()))
+    print server.handle('socket2', 'address2')
 
