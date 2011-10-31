@@ -6,17 +6,96 @@ from urlparse import urlparse
 from gevent import monkey
 from gevent import socket
 from gevent import pywsgi
+from gevent.server import StreamServer
 from StringIO import StringIO
 from collections import defaultdict
 import gevent
 import sys
 
-MAX_HEADER_LENGTH = 1500
+MAX_LINE_LENGTH = 1500
+
+def parse_header(file):
+    headers = {}
+    while True:
+        # Read each header should conform to a format of 'key:value\r\n'
+        header_line = file.readline(MAX_LINE_LENGTH + 1)
+
+        # If the header-line is larger than the default MTU, it's bogus
+        length = len(header_line)
+        if length > MAX_LINE_LENGTH:
+            raise RuntimeError('Refusing to parse extremely long header line; %s' % header_line )
+        if length == 0:
+            raise RuntimeError('HTTP header incorrectly terminated; expected "\\r\\n"')
+
+        # Is this the last line in the header?
+        if header_line == '\r\n':
+            return headers
+
+        try:
+            # If the line does not conform to accepted header format, split or the unpack should let us know
+            (key, value) = header_line.split(':', 1)
+        except ValueError:
+            raise RuntimeError('Malformed header found; %s' % header_line)
+        
+        # Strip the white space around the key and value
+        key = key.strip(); value = value.strip()
+
+        # This doesn't seam performant but is. See Commit 3fa292cf and 38b8c18e8
+        if key in headers:
+            if isinstance(headers[key], list):
+                headers[key].append(value)
+            else:
+                headers[key] = [headers[key], value]
+        else:
+            headers[key] = value
+
+    return headers
+
+    
+class Filter(object):
+    
+    def _next(self, iterator):
+        try:
+            return next(iterator)
+        except StopIteration:
+            return lambda socket, address, filter: (socket,address)
+
+class FilterExample(StreamServer):
+
+    def __init__(self, listener, filters=None, config=None):
+        self._filters = filters
+
+    def _next(self,socket, address, count):
+        if len(self._filters) > count:
+            return self._filters[count](socket,address,lambda socket, address: self._next(socket, address, count+1))
+        return (socket, address) 
+    
+    def handle(self, socket, address):
+        return self._next(socket, address, 0)
+
+class AsyncServer(StreamServer):
+
+    def __init__(self, listener, filters=None, config=None):
+        self._filters = filters
+        # XXX: Basic listener for now, will add SSL and optional args later via config
+        #StreamServer.__init__(self, listener)
+
+
+    def filters(self, _filters):
+        for _filter in _filters:
+            yield _filter
+
+    def handle(self, socket, address):
+        filter = self.filters(self._filters) 
+        try:
+            return next(filter)(socket, address, filter)
+        except StopIteration:
+            raise RuntimeError("XXX: No filters defined")
+
 
 class Response(object):
     
-    def __init__(self, client, file, version, status, reason, headers):
-        self.client = client
+    def __init__(self, file, version, status, reason, headers):
         self.version = version
         self.status = status
         self.reason = reason
@@ -25,54 +104,65 @@ class Response(object):
 
 
     def _normalizeHeaders(self,headers):
-        new_headers = {}
-
         try:
-            new_headers['Content-Length'] = int(headers['Content-Length'][0])
-            del headers['Content-Length']
+            headers['Content-Length'] = int(headers['Content-Length'])
         except ValueError:
             raise RuntimeError('Invalid value for "Content-Length" header; %s' % headers['content-length'][0])
         except KeyError:
             # Missing Content-Length is ok, it might be a chunked response
             pass
-
-        for (key,value) in headers.iteritems():
-            if len(value) > 1:
-                new_headers[key] = value
-                continue
-            new_headers[key] = value[0]
         
-        return new_headers
+        return headers
 
 
-    def read(self,length):
-        return self.file.read(length)
+    def _chunk_header(self, file):
+        # Read the chunk header line
+        line = file.readline(MAX_LINE_LENGTH + 1)
+        # If the status-line is larger than the default MTU, it's bogus
+        if len(line) > MAX_LINE_LENGTH:
+            raise RuntimeError('Refusing to parse extremely long chunk-header; %s' % line )
+
+        # Split out the header and the extension if it exists
+        header = line.split(';')
+        try:
+            # Interpret the length in HEX
+            header[0] = int(header[0], 16)
+        except KeyError, ValueError:
+            raise RuntimeError("Expected hexdecimal length while reading chunk header; %s" % line)
+       
+        return header
 
 
-    def readall(self, callback=None):
+    def read(self, callback=None):
+        # XXX: Check for values to read, don't want to block if the user calls us again
+
         try:
             # RFC2616 Sec 4.4
             # If a Transfer-Encoding header field (section 14.41) is present and has any value other than "identity", 
             # then the transfer-length is defined by use of the "chunked" transfer-coding (section 3.6), 
             # unless the message is terminated by closing the connection. 
-
             if self.headers['Transfer-Encoding'] != 'identity':
                 if self.file.closed: # XXX Does a file object know when a socket is closed?
-                    raise KeyError()
-                
-                while True:
+                    raise KeyError() # Forces a non-chunked read
+
+                result = []
+                while True: 
                     # Read chunk header
-                    (length, extensions) = self._chunk_header(self.file)
+                    chunked_header = self._chunk_header(self.file)
                     # Read the chunk
-                    data = self.file.read(length)
+                    payload = self.file.read(chunked_header[0])
                     # Read the trailer
-                    entity_headers = self.client._header(self.file)
-                    # Run the Call back if one is supplied XXX: Is this how we want todo this?
-                    if call_back:
-                        call_back(data)
+                    chunked_trailer = parse_header(self.file)
+                    # Run the Call back if one is supplied
+                    if callback:
+                        payload = callback(self.headers, chunked_header, chunked_trailer, payload )
+                    else:
+                        result.append(payload)
 
-                raise RuntimeError("Unknown 'Transfer-Encoding' aborting; %s" % self.headers['Transfer-Encoding'])
-
+                    # If no more data in the chunked response
+                    if len(payload) == 0:
+                        return ''.join(result)
+                    
         except KeyError:
             pass
 
@@ -81,8 +171,8 @@ class Response(object):
         except KeyError:
             raise RuntimeError("Unable to read response; missing 'Content-Length' header and 'Transfer-Encoding' is not 'chunked'")
 
-        # Check for 'Connection: close' header
-
+        # XXX: Check for 'Connection: close' header if it exists, close the connection here
+    
 
 class AsyncClient(object):
     
@@ -113,15 +203,15 @@ class AsyncClient(object):
 
     def _status_line(self, file):
         # Read the first line of the response ( should be the status-line )
-        status_line = file.readline(MAX_HEADER_LENGTH + 1)
+        line = file.readline(MAX_LINE_LENGTH + 1)
         # If the status-line is larger than the default MTU, it's bogus
-        if len(status_line) > MAX_HEADER_LENGTH:
-            raise RuntimeError('Refusing to parse extremely long status_line; %s' % status_line )
+        if len(line) > MAX_LINE_LENGTH:
+            raise RuntimeError('Refusing to parse extremely long status-line; %s' % line )
 
         try:
-            (http_version, status_code, reason_phrase) = status_line.split(None,2)
+            (http_version, status_code, reason_phrase) = line.split(None,2)
         except ValueError:
-            raise RuntimeError('Invalid HTTP/1.1 status line in response header; %s' % status_line)
+            raise RuntimeError('Invalid HTTP/1.1 status line in response header; %s' % line)
         
         if http_version != 'HTTP/1.1':
             raise RuntimeError('Server responded with unsupported HTTP Version; Only HTTP/1.1 supported')
@@ -132,35 +222,10 @@ class AsyncClient(object):
             if status_code < 100 or status_code > 999:
                 raise ValueError()
         except ValueError:
-            raise RuntimeError("Invalid status code in HTTP/1.1 status line; %s" % status_line)
+            raise RuntimeError("Invalid status code in HTTP/1.1 status line; %s" % line)
         
         return (11, status_code, reason_phrase.rstrip())
    
-
-    def _header(self, file):
-        headers = defaultdict(list)
-        while True:
-            # Read each header should conform to a format of 'key:value\r\n'
-            header_line = file.readline(MAX_HEADER_LENGTH + 1)
-
-            # If the header-line is larger than the default MTU, it's bogus
-            length = len(header_line)
-            if length > MAX_HEADER_LENGTH:
-                raise RuntimeError('Refusing to parse extremely long header line; %s' % header_line )
-            if length == 0:
-                raise RuntimeError('HTTP header incorrectly terminated; expected "\\r\\n"')
-
-            # Is this the last line in the header?
-            if header_line == '\r\n':
-                return headers
-
-            try:
-                # If the line does not conform to accepted header format, split or the unpack should let us know
-                (key, value) = header_line.split(':', 1)
-                headers[key.strip()].append(value.strip())
-            except ValueError:
-                raise RuntimeError('Malformed header found while parsing server response; %s' % header_line)
-        
 
     def _parse_response(self, sock):
         # Use a file like object so we can use readline()
@@ -168,9 +233,9 @@ class AsyncClient(object):
         # Parse the status line 
         (version, status, reason) = self._status_line(fd)
         # Parse the response headers
-        headers = self._header(fd)
+        headers = parse_header(fd)
         # Instanciate the user object Response()
-        return Response(self, fd, version, status, reason, headers)
+        return Response(fd, version, status, reason, headers)
 
         
     def get(self, url, timeout=socket._GLOBAL_DEFAULT_TIMEOUT):
@@ -199,7 +264,7 @@ class TestAsyncClient(TestCase):
 
 
     def setUp(self):
-        self.application = validator(self.application)
+        self.application = validator(self.chunked_app)
         self.server = pywsgi.WSGIServer(('127.0.0.1', 15001), self.application)
         self.server.start()
         self.port = self.server.server_port
@@ -265,36 +330,34 @@ class TestAsyncClient(TestCase):
         self.assertRaises(RuntimeError, client._status_line, StringIO('HTTP/1.1 200 \r\n'))
         self.assertRaises(RuntimeError, client._status_line, StringIO('200 OK\r\n'))
 
-    def test_header(self):
-        client = AsyncClient()
+    def test_parse_header(self):
         file = StringIO('Content-Type: text/plain\r\nContent-Length: 11\r\nDate: Fri, 28 Oct 2011 18:40:19 GMT\r\n\r\n')
 
-        headers = client._header(file)
-        self.assertEquals(dict(headers), { 'Content-Type': ['text/plain'],
-                                           'Content-Length': ['11'],
-                                           'Date': ['Fri, 28 Oct 2011 18:40:19 GMT'] })
+        headers = parse_header(file)
+        self.assertEquals(dict(headers), { 'Content-Type': 'text/plain',
+                                           'Content-Length': '11',
+                                           'Date': 'Fri, 28 Oct 2011 18:40:19 GMT' })
 
-    def test_header_raises(self):
-        client = AsyncClient()
+    def test_parse_header_raises(self):
 
         # Should raise on long header line ( aka, no \r\n )
         long_header = ''.join([ ' ' for x in range(1,1500) ])
-        self.assertRaises(RuntimeError, client._header, StringIO(long_header))
+        self.assertRaises(RuntimeError, parse_header, StringIO(long_header))
         
         # Should raise on incorrectly terminated headers
         file = StringIO('Content-Type: text/plain\r\nContent-Length: 11\r\nDate: Fri, 28 Oct 2011 18:40:19 GMT\r\n')
-        self.assertRaises(RuntimeError, client._header, file)
+        self.assertRaises(RuntimeError, parse_header, file)
         file = StringIO('Content-Type: text/plain\r\nContent-Length: 11\r\nDate: Fri, 28 Oct 2011 18:40:19 GMT')
-        self.assertRaises(RuntimeError, client._header, file)
+        self.assertRaises(RuntimeError, parse_header, file)
         
         # Should raise on malformed, garbage headers
         file = StringIO('Content-Type- text/plain\r\nContent-LengthASDF#$^@#$G@#G#@%H@#$BH@#$#$')
-        self.assertRaises(RuntimeError, client._header, file)
+        self.assertRaises(RuntimeError, parse_header, file)
 
 
     def test_connect(self):
         resp = AsyncClient().get('http://127.0.0.1:15001/')
-        print resp.readall()
+        print resp.read()
 
 
 
@@ -302,7 +365,62 @@ class TestResponse(TestCase):
 
     def test_constructor(self):
         
-        resp = Response(AsyncClient, StringIO(''), 11, 200, 'OK', {'Content-Length':['11'], 'Param':['1','2']})
+        resp = Response(StringIO(''), 11, 200, 'OK', {'Content-Length':'11', 'Param':['1','2']})
         self.assertEquals(resp.headers, {'Content-Length': 11, 'Param':['1','2']} )
 
+    
+class TestFilter1(Filter):
+    def __call__(self, socket, address, filter):
+        #print "TestFilter1"
+        return self._next(filter)(socket,address,filter)
 
+class TestFilter2(Filter):
+    def __call__(self, socket, address, filter):
+        #print "TestFilter2"
+        return self._next(filter)(socket,address,filter)
+
+
+def test_filter1(socket, address, filter):
+    #print "Test Filter1"
+    try:
+        return next(filter)(socket,address,filter)
+    except StopIteration:
+        return (socket,address)
+        
+
+def test_filter2(socket, address, filter):
+    #print "Test Filter2"
+    try:
+        return next(filter)(socket,address,filter)
+    except StopIteration:
+        return (socket,address)
+
+
+def example1(socket, address, _next):
+    #print "example1"
+    return _next(socket, address)
+    
+def example2(socket, address, _next):
+    #print "example2"
+    return _next(socket, address)
+
+
+if __name__ == "__main__":
+    # ===== FASTEST ======
+    #server = AsyncServer(('localhost', 'port'), filters=(test_filter1,test_filter2))
+    #for i in range(1, 10000000):
+    #    result = server.handle('socket', 'address')
+    #print result
+
+    # ===== SLOWER ======
+    #server = AsyncServer(('localhost', 'port'), filters=(TestFilter1(),TestFilter2()))
+    #for i in range(1, 10000000):
+    #    result = server.handle('socket2', 'address2')
+    #print result
+
+    # ===== SLOWEST ======
+    server = FilterExample(('localhost', 'port'), filters=(example1,example2))
+    for i in range(1, 10000000):
+        result = server.handle('socket3', 'address3')
+    print result
+    
