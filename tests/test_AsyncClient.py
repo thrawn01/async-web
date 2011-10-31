@@ -60,12 +60,24 @@ class Filter(object):
         except StopIteration:
             return lambda socket, address, filter: (socket,address)
 
+class FilterExample(StreamServer):
+
+    def __init__(self, listener, filters=None, config=None):
+        self._filters = filters
+
+    def _next(self,socket, address, count):
+        try:
+            return self._filters[count](socket,address,lambda socket, address: self._next(socket, address, count+1))
+        except IndexError:
+            return (socket, address) 
+    
+    def handle(self, socket, address):
+        return self._next(socket, address, 0)
 
 class AsyncServer(StreamServer):
 
     def __init__(self, listener, filters=None, config=None):
         self._filters = filters
-        pass
         # XXX: Basic listener for now, will add SSL and optional args later via config
         #StreamServer.__init__(self, listener)
 
@@ -384,6 +396,16 @@ def test_filter2(socket, address, filter):
     except StopIteration:
         return (socket,address)
 
+
+def example1(socket, address, _next):
+    print "example1"
+    return _next(socket, address)
+    
+def example2(socket, address, _next):
+    print "example2"
+    return _next(socket, address)
+
+
 if __name__ == "__main__":
     # Test with functions
     server = AsyncServer(('localhost', 'port'), filters=(test_filter1,test_filter2))
@@ -392,3 +414,6 @@ if __name__ == "__main__":
     server = AsyncServer(('localhost', 'port'), filters=(TestFilter1(),TestFilter2()))
     print server.handle('socket2', 'address2')
 
+    server = FilterExample(('localhost', 'port'), filters=(example1,example2))
+    print server.handle('socket3', 'address3')
+    
