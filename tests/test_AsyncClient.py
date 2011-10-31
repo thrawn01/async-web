@@ -52,17 +52,11 @@ def parse_header(file):
     return headers
 
     
-class Filter(object):
-    
-    def _next(self, iterator):
-        try:
-            return next(iterator)
-        except StopIteration:
-            return lambda socket, address, filter: (socket,address)
 
-class FilterExample(StreamServer):
+class AsyncServer(StreamServer):
 
     def __init__(self, listener, filters=None, config=None):
+        StreamServer.__init__(self, listener)
         self._filters = filters
 
     def _next(self,socket, address, count):
@@ -73,24 +67,6 @@ class FilterExample(StreamServer):
     def handle(self, socket, address):
         return self._next(socket, address, 0)
 
-class AsyncServer(StreamServer):
-
-    def __init__(self, listener, filters=None, config=None):
-        self._filters = filters
-        # XXX: Basic listener for now, will add SSL and optional args later via config
-        #StreamServer.__init__(self, listener)
-
-
-    def filters(self, _filters):
-        for _filter in _filters:
-            yield _filter
-
-    def handle(self, socket, address):
-        filter = self.filters(self._filters) 
-        try:
-            return next(filter)(socket, address, filter)
-        except StopIteration:
-            raise RuntimeError("XXX: No filters defined")
 
 
 class Response(object):
@@ -364,63 +340,52 @@ class TestAsyncClient(TestCase):
 class TestResponse(TestCase):
 
     def test_constructor(self):
-        
         resp = Response(StringIO(''), 11, 200, 'OK', {'Content-Length':'11', 'Param':['1','2']})
         self.assertEquals(resp.headers, {'Content-Length': 11, 'Param':['1','2']} )
 
+
+class TestAsyncServer(TestCase):
+
+    def connect(self, host, port):
+        return socket.create_connection((host, port))
     
-class TestFilter1(Filter):
-    def __call__(self, socket, address, filter):
-        #print "TestFilter1"
-        return self._next(filter)(socket,address,filter)
+    def stop(self, server):
+        timeout = gevent.Timeout(0.5,RuntimeError("Timeout trying to stop server"))
+        timeout.start()
+        try:
+            server.stop()
+        finally:
+            timeout.cancel()
 
-class TestFilter2(Filter):
-    def __call__(self, socket, address, filter):
-        #print "TestFilter2"
-        return self._next(filter)(socket,address,filter)
-
-
-def test_filter1(socket, address, filter):
-    #print "Test Filter1"
-    try:
-        return next(filter)(socket,address,filter)
-    except StopIteration:
-        return (socket,address)
-        
-
-def test_filter2(socket, address, filter):
-    #print "Test Filter2"
-    try:
-        return next(filter)(socket,address,filter)
-    except StopIteration:
-        return (socket,address)
+    def filter1(self, socket, address, _next):
+        return _next('filter1', address)
 
 
-def example1(socket, address, _next):
-    #print "example1"
-    return _next(socket, address)
-    
-def example2(socket, address, _next):
-    #print "example2"
-    return _next(socket, address)
+    def filter2(self, socket, address, _next):
+        return _next(socket, 'filter2')
 
 
-if __name__ == "__main__":
-    # ===== FASTEST ======
-    #server = AsyncServer(('localhost', 'port'), filters=(test_filter1,test_filter2))
-    #for i in range(1, 10000000):
-    #    result = server.handle('socket', 'address')
-    #print result
+    def test_filters(self):
+        server = AsyncServer(('127.0.0.1', 15001), (self.filter1, self.filter2))
+        self.assertEquals(server.handle('socket','address'), ('filter1','filter2'))
 
-    # ===== SLOWER ======
-    #server = AsyncServer(('localhost', 'port'), filters=(TestFilter1(),TestFilter2()))
-    #for i in range(1, 10000000):
-    #    result = server.handle('socket2', 'address2')
-    #print result
 
-    # ===== SLOWEST ======
-    server = FilterExample(('localhost', 'port'), filters=(example1,example2))
-    for i in range(1, 10000000):
-        result = server.handle('socket3', 'address3')
-    print result
+    def echo(self, socket, address, _next):
+        fd = socket.makefile('rb')
+        line = fd.readline(1500)
+        fd.write(line)
+        fd.flush()
+        return _next(socket, address)
+
+
+    def test_raw_connect(self):
+        # Create a simple server with a filter than echo's everything written to it
+        server = AsyncServer(('127.0.0.1', 15001), (self.echo,))
+        server.start()
+        socket = self.connect('127.0.0.1', 15001)
+        socket.send('hello\n')
+        self.assertEquals(socket.recv(6), 'hello\n')
+        self.stop(server)
+
+
     
