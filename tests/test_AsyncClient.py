@@ -66,10 +66,9 @@ class FilterExample(StreamServer):
         self._filters = filters
 
     def _next(self,socket, address, count):
-        try:
+        if len(self._filters) > count:
             return self._filters[count](socket,address,lambda socket, address: self._next(socket, address, count+1))
-        except IndexError:
-            return (socket, address) 
+        return (socket, address) 
     
     def handle(self, socket, address):
         return self._next(socket, address, 0)
@@ -410,13 +409,13 @@ if __name__ == "__main__":
     # ===== FASTEST ======
     #server = AsyncServer(('localhost', 'port'), filters=(test_filter1,test_filter2))
     #for i in range(1, 10000000):
-        #result = server.handle('socket', 'address')
+    #    result = server.handle('socket', 'address')
     #print result
 
     # ===== SLOWER ======
     #server = AsyncServer(('localhost', 'port'), filters=(TestFilter1(),TestFilter2()))
     #for i in range(1, 10000000):
-        #result = server.handle('socket2', 'address2')
+    #    result = server.handle('socket2', 'address2')
     #print result
 
     # ===== SLOWEST ======
