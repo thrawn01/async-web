@@ -12,7 +12,15 @@ from collections import defaultdict
 import gevent
 import sys
 
-MAX_LINE_LENGTH = 1500
+MAX_LINE_LENGTH = 8192
+SUPPORTED_METHODS = ('GET', 'POST', 'PUT', 'DELETE', 'TRACE', 'OPTIONS', 'HEAD')
+
+class HTTPException(RuntimeError):
+    
+    def __init__(code, reason):
+        self.code = code
+        self.reason = reason
+
 
 def parse_header(file):
     headers = {}
@@ -20,12 +28,12 @@ def parse_header(file):
         # Read each header should conform to a format of 'key:value\r\n'
         header_line = file.readline(MAX_LINE_LENGTH + 1)
 
-        # If the header-line is larger than the default MTU, it's bogus
+        # If the status-line is to large, it's bogus
         length = len(header_line)
         if length > MAX_LINE_LENGTH:
-            raise RuntimeError('Refusing to parse extremely long header line; %s' % header_line )
+            raise HTTPException(400, 'Refusing to parse extremely long header line; %s' % header_line )
         if length == 0:
-            raise RuntimeError('HTTP header incorrectly terminated; expected "\\r\\n"')
+            raise HTTPException(400, 'HTTP header incorrectly terminated; expected "\\r\\n"')
 
         # Is this the last line in the header?
         if header_line == '\r\n':
@@ -35,7 +43,7 @@ def parse_header(file):
             # If the line does not conform to accepted header format, split or the unpack should let us know
             (key, value) = header_line.split(':', 1)
         except ValueError:
-            raise RuntimeError('Malformed header found; %s' % header_line)
+            raise HTTPException(400, 'Malformed header found; %s' % header_line)
         
         # Strip the white space around the key and value
         key = key.strip(); value = value.strip()
@@ -51,21 +59,69 @@ def parse_header(file):
 
     return headers
 
-    
 
 class AsyncServer(StreamServer):
+
 
     def __init__(self, listener, filters=None, config=None):
         StreamServer.__init__(self, listener)
         self._filters = filters
 
+
     def _next(self,socket, address, count):
         if len(self._filters) > count:
             return self._filters[count](socket,address,lambda socket, address: self._next(socket, address, count+1))
         return (socket, address) 
-    
-    def handle(self, socket, address):
-        return self._next(socket, address, 0)
+
+
+    def _status_line(self, file):
+        # Read the first line of the response ( should be the status-line )
+        line = file.readline(MAX_LINE_LENGTH + 1)
+        # If the status-line is to large, it's bogus
+        if len(line) > MAX_LINE_LENGTH:
+            raise RuntimeError('Refusing to parse extremely long status-line; %s' % line )
+
+        try:
+            # If the line does not conform to accepted status line, split or the unpack should let us know
+            (method, path, http_version) = line.split(None,2)
+        except ValueError:
+            raise RuntimeError('Invalid HTTP/1.1 status line in request header; %s' % line)
+        
+        if http_version != 'HTTP/1.1':
+            raise RuntimeError('Client requested unsupported HTTP Version; Only HTTP/1.1 supported')
+        
+        if not method in SUPPORTED_METHODS:
+            raise HTTPException(405, "Client requested un-supported method in HTTP/1.1 status line; %s" % line)
+
+        return (method, path, 11)
+        
+
+    def handle(self, sock, address):
+        try:
+            # Use a file like object so we can use readline()
+            fd = sock.makefile('fb')
+            # Parse the status line 
+            (method, path, version) = self._status_line(fd)
+            # Parse the response headers
+            headers = parse_header(fd)
+            # Create the Request Object
+            request = Request(fd, method=method, path=path, version=version, headers=headers)
+            # Create the Response Object
+            response = Response(fd, version=version, status=200, reason='OK')
+            # Pass the Request and Response objects to the next filter on the chain
+            return self._next(request, Response(sock), 0)
+
+        except HTTPException, e:
+            print "Code: %s Reason: %s" % (e.code, e.reason)
+            #self.errors(socket, e.code, e.reason)
+
+
+    def errors(response, e.code, e.reason):
+        # XXX: log.audit() - log all errors to the audit log?
+        #if code == 405:
+            #response.headers['Allow'] = ','.join(SUPPORTED_METHODS)
+        #response.write('')    
+        pass
 
 
 
@@ -94,7 +150,7 @@ class Response(object):
     def _chunk_header(self, file):
         # Read the chunk header line
         line = file.readline(MAX_LINE_LENGTH + 1)
-        # If the status-line is larger than the default MTU, it's bogus
+        # If the status-line is to large, it's bogus
         if len(line) > MAX_LINE_LENGTH:
             raise RuntimeError('Refusing to parse extremely long chunk-header; %s' % line )
 
@@ -180,11 +236,12 @@ class AsyncClient(object):
     def _status_line(self, file):
         # Read the first line of the response ( should be the status-line )
         line = file.readline(MAX_LINE_LENGTH + 1)
-        # If the status-line is larger than the default MTU, it's bogus
+        # If the status-line is to large, it's bogus
         if len(line) > MAX_LINE_LENGTH:
             raise RuntimeError('Refusing to parse extremely long status-line; %s' % line )
 
         try:
+            # If the line does not conform to accepted status line, split or the unpack should let us know
             (http_version, status_code, reason_phrase) = line.split(None,2)
         except ValueError:
             raise RuntimeError('Invalid HTTP/1.1 status line in response header; %s' % line)
@@ -201,8 +258,7 @@ class AsyncClient(object):
             raise RuntimeError("Invalid status code in HTTP/1.1 status line; %s" % line)
         
         return (11, status_code, reason_phrase.rstrip())
-   
-
+    
     def _parse_response(self, sock):
         # Use a file like object so we can use readline()
         fd = sock.makefile('fb')
@@ -370,22 +426,17 @@ class TestAsyncServer(TestCase):
         self.assertEquals(server.handle('socket','address'), ('filter1','filter2'))
 
 
-    def echo(self, socket, address, _next):
-        fd = socket.makefile('rb')
-        line = fd.readline(1500)
-        fd.write(line)
-        fd.flush()
+    def routes(self, request, response, _next):
+        response.write("hello world")
         return _next(socket, address)
 
 
-    def test_raw_connect(self):
-        # Create a simple server with a filter than echo's everything written to it
-        server = AsyncServer(('127.0.0.1', 15001), (self.echo,))
+    def test_http_connect(self):
+        # Create a simple server with a filter that always responds with 'hello world'
+        server = AsyncServer(('127.0.0.1', 15001), (routes,))
         server.start()
-        socket = self.connect('127.0.0.1', 15001)
-        socket.send('hello\n')
-        self.assertEquals(socket.recv(6), 'hello\n')
+
+        resp = AsyncClient().get('http://127.0.0.1:15001/')
+        print resp.read()
         self.stop(server)
 
-
-    
