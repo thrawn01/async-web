@@ -10,16 +10,20 @@ from gevent.server import StreamServer
 from StringIO import StringIO
 from collections import defaultdict
 import gevent
+import time
 import sys
 
 MAX_LINE_LENGTH = 8192
 SUPPORTED_METHODS = ('GET', 'POST', 'PUT', 'DELETE', 'TRACE', 'OPTIONS', 'HEAD')
 
-class HTTPException(RuntimeError):
-    
-    def __init__(self, code, reason):
-        self.code = code
-        self.reason = reason
+# Weekday and month names for HTTP date/time formatting
+WEEK_DAY_NAME = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+MONTH_NAME = [None,  # Dummy so we can use 1-based month numbers
+              "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+              "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+def http_date_time(timestamp):
+    year, month, day, hh, mm, ss, wd, _y, _z = time.gmtime(timestamp)
+    return "%s, %02d %3s %4d %02d:%02d:%02d GMT" % (WEEK_DAY_NAME[wd], day, MONTH_NAME[month], year, hh, mm, ss)
 
 
 def parse_header(file):
@@ -86,6 +90,29 @@ def parse_chunk_header(file):
     return chunk_header
 
 
+def compose_status_line(version, status, reason):
+    if version != 11:
+        raise RuntimeError("Response version is not HTTP/1.1; Only HTTP/1.1 is supported")
+    return ['HTTP/1.1 %s %s\r\n' % (status, reason),]
+
+
+def compose_header(headers, _time=time.time()):
+    if 'Date' not in headers:
+        headers['Date'] = http_date_time(_time)
+
+    # Alway default to text/plain if Content-Type not specified
+    if 'Content-Type' not in headers:
+        headers['Content-Type'] = 'text/plain'
+   
+    return ['\r\n'.join(['%s: %s' % item for item in headers.items()]), '\r\n\r\n']
+
+
+class HTTPException(RuntimeError):
+    
+    def __init__(self, code, reason):
+        self.code = code
+        self.reason = reason
+
 
 class AsyncServer(StreamServer):
 
@@ -116,37 +143,38 @@ class AsyncServer(StreamServer):
         if http_version != 'HTTP/1.1':
             raise RuntimeError('Client requested unsupported HTTP Version; Only HTTP/1.1 supported')
         
-        if not method in SUPPORTED_METHODS:
+        if method not in SUPPORTED_METHODS:
             raise HTTPException(405, "Client requested un-supported method in HTTP/1.1 status line; %s" % line)
 
         return (method, path, 11)
         
 
     def handle(self, sock, address):
+        # Use a file like object so we can use readline()
+        fd = sock.makefile('fb')
+        # Create the Response Object
+        response = Response(fd, {}, version=version, status=200, reason='OK')
         try:
-            # Use a file like object so we can use readline()
-            fd = sock.makefile('fb')
             # Parse the status line 
             (method, path, version) = self._status_line(fd)
             # Parse the response headers
             headers = parse_header(fd)
-            # Create the Request Object
-            request = Request(fd, method=method, path=path, version=version, headers=headers)
-            # Create the Response Object
-            response = Response(fd, version=version, status=200, reason='OK')
-            # Pass the Request and Response objects to the next filter on the chain
-            return self._next(request, Response(sock), 0)
-
         except HTTPException, e:
-            print "Code: %s Reason: %s" % (e.code, e.reason)
-            #self.errors(socket, e.code, e.reason)
+            self.errors(socket, e.code, e.reason)
+        
+        # Create the Request Object
+        request = Request(fd, headers, method=method, path=path, version=version, address=address)
+        # Pass the Request and Response objects to the next filter on the chain
+        self._next(request, Response(sock), 0)
 
 
     def errors(response, code, reason):
+        print "Error - Code: %s Reason: %s" % (e.code, e.reason)
         # XXX: log.audit() - log all errors to the audit log?
-        #if code == 405:
-            #response.headers['Allow'] = ','.join(SUPPORTED_METHODS)
-        #response.write('')    
+        if code == 405:
+            response.set(code=code, reason=reason, headers={'Allow': ','.join(SUPPORTED_METHODS)} )
+
+        response.write('')    
         pass
 
 
@@ -154,18 +182,23 @@ class AsyncServer(StreamServer):
 class HTTPSocket(object):
 
     def __init__(self, file, headers, **attrs):
+        self.headers = headers
+        self.set(**attrs)
+        self.file = file
+
+
+    def toList(self):
+        return list(self.__dict__)
+
+
+    def __iter__(self, key):
+        return self.__dict__
+
+
+    def set(self, **attrs):
         for key,value in attrs.items():
             setattr(self, key, value)
 
-        self.headers = headers
-        self.file = file
-
-    def toList( self ):
-        return list(self.__dict__)
-        
-    def __iter__( self, key):
-        return self.__dict__
-   
 
     def read(self, callback=None):
         # XXX: Check for values to read, don't want to block if the user calls us again
@@ -208,6 +241,22 @@ class HTTPSocket(object):
         # XXX: Check for 'Connection: close' header if it exists, close the connection here
 
 
+
+    def write(self, data):
+
+        # Un-Chunked response
+        length = len(data)
+        if length != 0:
+            self.headers['Content-Length'] = length
+
+        # Compose the response
+        payload = compose_status_line(self.version, self.status, self.reason)
+        payload.append(compose_header(self.headers))
+        payload.append(data)
+        
+        return self.file.write(''.join(payload))
+
+
 class Request(HTTPSocket):
     
     def __init__(self, file, headers, **attrs):
@@ -238,7 +287,7 @@ class AsyncClient(object):
         path = url.path or '/'
         scheme = url[0]
 
-        if not 'http' in scheme:
+        if 'http' not in scheme:
             raise RuntimeError("Only (http,https) supported")
 
         return (scheme, url.hostname, port, path)
@@ -387,6 +436,13 @@ class TestAsyncClient(TestCase):
         self.assertEquals(dict(headers), { 'Content-Type': 'text/plain',
                                            'Content-Length': 11,
                                            'Date': 'Fri, 28 Oct 2011 18:40:19 GMT' })
+    
+    def test_create_header(self):
+        header = compose_header({ 'Always': 'GET,HEAD,POST' }, _time=1320269615.928314)
+        result = [ "Date: Wed, 02 Nov 2011 21:33:35 GMT\r\n" \
+                 "Always: GET,HEAD,POST\r\n" \
+                 "Content-Type: text/plain","\r\n\r\n"]
+        self.assertEquals(header, result)
 
     def test_parse_header_raises(self):
 
