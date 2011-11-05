@@ -100,17 +100,13 @@ def compose_header(headers, _time=time.time()):
     if 'Date' not in headers:
         headers['Date'] = http_date_time(_time)
 
-    # Alway default to text/plain if Content-Type not specified
-    if 'Content-Type' not in headers:
-        headers['Content-Type'] = 'text/plain'
-   
     return ['\r\n'.join(['%s: %s' % item for item in headers.items()]), '\r\n\r\n']
 
 
 class HTTPException(RuntimeError):
     
-    def __init__(self, code, reason):
-        self.code = code
+    def __init__(self, status, reason):
+        self.status = status
         self.reason = reason
 
 
@@ -121,10 +117,10 @@ class AsyncServer(StreamServer):
         self._filters = filters
 
 
-    def _next(self,socket, address, count):
+    def _next(self,request, response, count):
         if len(self._filters) > count:
-            return self._filters[count](socket,address,lambda socket, address: self._next(socket, address, count+1))
-        return (socket, address) 
+            return self._filters[count](socket,address,lambda socket, address: self._next(request, response, count+1))
+        return (request, response) 
 
 
     def _status_line(self, file):
@@ -140,7 +136,7 @@ class AsyncServer(StreamServer):
         except ValueError:
             raise RuntimeError('Invalid HTTP/1.1 status line in request header; %s' % line)
         
-        if http_version != 'HTTP/1.1':
+        if not http_version.startswith('HTTP/1.1'):
             raise RuntimeError('Client requested unsupported HTTP Version; Only HTTP/1.1 supported')
         
         if method not in SUPPORTED_METHODS:
@@ -153,27 +149,30 @@ class AsyncServer(StreamServer):
         # Use a file like object so we can use readline()
         fd = sock.makefile('fb')
         # Create the Response Object
-        response = Response(fd, {}, version=version, status=200, reason='OK')
+        response = Response(fd, {}, version=11, status=200, reason='OK')
         try:
             # Parse the status line 
             (method, path, version) = self._status_line(fd)
             # Parse the response headers
             headers = parse_header(fd)
+            # Create the Request Object
+            request = Request(fd, headers, method=method, path=path, version=version, address=address)
+            # Pass the Request and Response objects to the next filter on the chain
+            self._next(request, response, 0)
+
         except HTTPException, e:
-            self.errors(socket, e.code, e.reason)
-        
-        # Create the Request Object
-        request = Request(fd, headers, method=method, path=path, version=version, address=address)
-        # Pass the Request and Response objects to the next filter on the chain
-        self._next(request, Response(sock), 0)
+            self.errors(response, e.status, e.reason)
+        except:
+            # XXX: Dump a stack trace to the log
+            self.errors(response, 500, "Internal Server Error")
 
-
-    def errors(response, code, reason):
-        print "Error - Code: %s Reason: %s" % (e.code, e.reason)
+    def errors(self, response, status, reason):
+        print "Error - Code: %s Reason: %s" % (status, reason)
+        response.set(status=status, reason=reason)
         # XXX: log.audit() - log all errors to the audit log?
-        if code == 405:
-            response.set(code=code, reason=reason, headers={'Allow': ','.join(SUPPORTED_METHODS)} )
-
+        if status == 405:
+            response.headers = { 'Allow': ','.join(SUPPORTED_METHODS) }
+        
         response.write('')    
         pass
 
@@ -236,6 +235,10 @@ class HTTPSocket(object):
         try:
             return self.file.read(self.headers['Content-Length'])
         except KeyError:
+            # If the status was not 200, then it was an HTTP error with no payload
+            if self.status != 200:
+                raise HTTPException(self.status, self.reason)
+            # Else the server responded incorrectly
             raise RuntimeError("Unable to read response; missing 'Content-Length' header and 'Transfer-Encoding' is not 'chunked'")
 
         # XXX: Check for 'Connection: close' header if it exists, close the connection here
@@ -248,12 +251,16 @@ class HTTPSocket(object):
         length = len(data)
         if length != 0:
             self.headers['Content-Length'] = length
+            # Alway default to text/plain if Content-Type not specified
+            if 'Content-Type' not in headers:
+                self.headers['Content-Type'] = 'text/plain'
 
         # Compose the response
         payload = compose_status_line(self.version, self.status, self.reason)
-        payload.append(compose_header(self.headers))
+        payload.extend(compose_header(self.headers))
         payload.append(data)
-        
+        print "Payload ", payload
+        print "Payload ", ''.join(payload)
         return self.file.write(''.join(payload))
 
 
@@ -508,11 +515,12 @@ class TestAsyncServer(TestCase):
         return _next(socket, address)
 
 
-    #def test_http_connect(self):
+    def test_http_connect(self):
         ## Create a simple server with a filter that always responds with 'hello world'
-        #server = AsyncServer(('127.0.0.1', 15001), (routes,))
-        #server.start()
-        #resp = AsyncClient().get('http://127.0.0.1:15001/')
-        #print resp.read()
-        #self.stop(server)
+        server = AsyncServer(('127.0.0.1', 15001), (self.routes,))
+        server.start()
+
+        resp = AsyncClient().get('http://127.0.0.1:15001/')
+        print resp.read()
+        self.stop(server)
 
