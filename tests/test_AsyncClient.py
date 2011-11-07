@@ -9,6 +9,7 @@ from gevent import pywsgi
 from gevent.server import StreamServer
 from StringIO import StringIO
 from collections import defaultdict
+import traceback
 import gevent
 import time
 import sys
@@ -103,6 +104,15 @@ def compose_header(headers, _time=time.time()):
     return ['\r\n'.join(['%s: %s' % item for item in headers.items()]), '\r\n\r\n']
 
 
+def log_error(msg):
+    sys.stderr.write(msg + '\n')
+
+
+def log_access():
+    pass
+
+
+
 class HTTPException(RuntimeError):
     
     def __init__(self, status, reason):
@@ -118,8 +128,8 @@ class AsyncServer(StreamServer):
 
 
     def _next(self,request, response, count):
-        if len(self._filters) > count:
-            return self._filters[count](socket,address,lambda socket, address: self._next(request, response, count+1))
+        if count < len(self._filters):
+            return self._filters[count](request, response, lambda req, resp: self._next(req, resp, count+1))
         return (request, response) 
 
 
@@ -163,18 +173,23 @@ class AsyncServer(StreamServer):
         except HTTPException, e:
             self.errors(response, e.status, e.reason)
         except:
-            # XXX: Dump a stack trace to the log
+            # Dump a stack trace to the log
+            log_error(traceback.format_exc())
+            # Inform the client of the error
             self.errors(response, 500, "Internal Server Error")
 
+
     def errors(self, response, status, reason):
-        print "Error - Code: %s Reason: %s" % (status, reason)
-        response.set(status=status, reason=reason)
         # XXX: log.audit() - log all errors to the audit log?
+        log_error("Code: %s Reason: %s" % (status, reason))
+
+        # All responses have a reason and a status
+        response.set(status=status, reason=reason)
+
         if status == 405:
             response.headers = { 'Allow': ','.join(SUPPORTED_METHODS) }
         
         response.write('')    
-        pass
 
 
 
@@ -220,6 +235,7 @@ class HTTPSocket(object):
                     # Read the trailer
                     chunked_trailer = parse_header(self.file)
                     # Run the Call back if one is supplied
+                    # XXX: Remove this call back, just return the data for each chunk, add a method call readall()
                     if callback:
                         payload = callback(self.headers, chunked_header, chunked_trailer, payload )
                     else:
@@ -252,15 +268,15 @@ class HTTPSocket(object):
         if length != 0:
             self.headers['Content-Length'] = length
             # Alway default to text/plain if Content-Type not specified
-            if 'Content-Type' not in headers:
+            if 'Content-Type' not in self.headers:
                 self.headers['Content-Type'] = 'text/plain'
 
         # Compose the response
         payload = compose_status_line(self.version, self.status, self.reason)
         payload.extend(compose_header(self.headers))
         payload.append(data)
-        print "Payload ", payload
-        print "Payload ", ''.join(payload)
+        #print "Payload ", payload
+        #print "Payload ", ''.join(payload)
         return self.file.write(''.join(payload))
 
 
@@ -360,13 +376,13 @@ class TestAsyncClient(TestCase):
     @staticmethod
     def chunked_app(env, start_response):
         start_response('200 OK', [('Content-Type', 'text/plain')])
-        yield 'hello world'
+        yield 'wsgi hello world'
 
 
     @staticmethod
     def application(env, start_response):
-        start_response('200 OK', [('Content-Type', 'text/plain'),('Content-Length', '11')])
-        return ['hello world']
+        start_response('200 OK', [('Content-Type', 'text/plain'),('Content-Length', '16')])
+        return ['wsgi hello world']
 
 
     def setUp(self):
@@ -447,8 +463,7 @@ class TestAsyncClient(TestCase):
     def test_create_header(self):
         header = compose_header({ 'Always': 'GET,HEAD,POST' }, _time=1320269615.928314)
         result = [ "Date: Wed, 02 Nov 2011 21:33:35 GMT\r\n" \
-                 "Always: GET,HEAD,POST\r\n" \
-                 "Content-Type: text/plain","\r\n\r\n"]
+                 "Always: GET,HEAD,POST", "\r\n\r\n"]
         self.assertEquals(header, result)
 
     def test_parse_header_raises(self):
@@ -488,7 +503,8 @@ class TestAsyncServer(TestCase):
 
     def connect(self, host, port):
         return socket.create_connection((host, port))
-    
+   
+
     def stop(self, server):
         timeout = gevent.Timeout(0.5,RuntimeError("Timeout trying to stop server"))
         timeout.start()
@@ -496,6 +512,7 @@ class TestAsyncServer(TestCase):
             server.stop()
         finally:
             timeout.cancel()
+
 
     def filter1(self, socket, address, _next):
         return _next('filter1', address)
@@ -512,15 +529,19 @@ class TestAsyncServer(TestCase):
 
     def routes(self, request, response, _next):
         response.write("hello world")
-        return _next(socket, address)
+        return _next(request, response)
 
 
     def test_http_connect(self):
         ## Create a simple server with a filter that always responds with 'hello world'
         server = AsyncServer(('127.0.0.1', 15001), (self.routes,))
         server.start()
+        
+        try:
+            resp = AsyncClient().get('http://127.0.0.1:15001/')
+            print resp.read()
+        except HTTPException, e:
+            print "Status: %s Reason: %s" % (e.status, e.reason)
 
-        resp = AsyncClient().get('http://127.0.0.1:15001/')
-        print resp.read()
         self.stop(server)
 
