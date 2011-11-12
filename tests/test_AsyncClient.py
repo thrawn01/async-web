@@ -14,6 +14,8 @@ import gevent
 import time
 import sys
 
+from websocket.server import WebSocketServer
+
 MAX_LINE_LENGTH = 8192
 SUPPORTED_METHODS = ('GET', 'POST', 'PUT', 'DELETE', 'TRACE', 'OPTIONS', 'HEAD')
 
@@ -27,7 +29,7 @@ def http_date_time(timestamp):
     return "%s, %02d %3s %4d %02d:%02d:%02d GMT" % (WEEK_DAY_NAME[wd], day, MONTH_NAME[month], year, hh, mm, ss)
 
 
-def parse_header(file):
+def parse_header(file, debug=None):
     headers = {}
     while True:
         # Read each header should conform to a format of 'key:value\r\n'
@@ -39,6 +41,8 @@ def parse_header(file):
             raise HTTPException(400, 'Refusing to parse extremely long header line; %s' % header_line )
         if length == 0:
             raise HTTPException(400, 'HTTP header incorrectly terminated; expected "\\r\\n"')
+        
+        if debug: debug.write('-- header: %s' % header_line)
 
         # Is this the last line in the header?
         if header_line == '\r\n':
@@ -249,13 +253,17 @@ class HTTPSocket(object):
             pass
 
         try:
-            return self.file.read(self.headers['Content-Length'])
+            length = self.headers['Content-Length']
+            # Server might respond with
+            if length <= 0:
+                raise KeyError()
+            return self.file.read(length)
         except KeyError:
             # If the status was not 200, then it was an HTTP error with no payload
             if self.status != 200:
                 raise HTTPException(self.status, self.reason)
             # Else the server responded incorrectly
-            raise RuntimeError("Unable to read response; missing 'Content-Length' header and 'Transfer-Encoding' is not 'chunked'")
+            raise RuntimeError("Unable to read response; missing 'Content-Length' header or 'Content-Length' is 0 and 'Transfer-Encoding' is not 'chunked'")
 
         # XXX: Check for 'Connection: close' header if it exists, close the connection here
 
@@ -321,12 +329,14 @@ class AsyncClient(object):
         return "%s %s %s\r\n%s\r\n\r\n" % (method, path, version,"\r\n".join(headers))
 
 
-    def _status_line(self, file):
+    def _status_line(self, file, debug=None):
         # Read the first line of the response ( should be the status-line )
         line = file.readline(MAX_LINE_LENGTH + 1)
         # If the status-line is to large, it's bogus
         if len(line) > MAX_LINE_LENGTH:
             raise RuntimeError('Refusing to parse extremely long status-line; %s' % line )
+        
+        if debug: debug.write('-- status: %s' % line)
 
         try:
             # If the line does not conform to accepted status line, split or the unpack should let us know
@@ -352,9 +362,9 @@ class AsyncClient(object):
         # Use a file like object so we can use readline()
         fd = sock.makefile('fb')
         # Parse the status line 
-        (version, status, reason) = self._status_line(fd)
+        (version, status, reason) = self._status_line(fd, sys.stderr)
         # Parse the response headers
-        headers = parse_header(fd)
+        headers = parse_header(fd, sys.stderr)
         # Instanciate the user object Response()
         return Response(fd, headers, http_version=version, status=status, reason=reason)
 
@@ -368,15 +378,79 @@ class AsyncClient(object):
         sock.send(self._request_header('GET', path, (('Host',host),)))
         # Parse the response and return a Request Object      
         return self._parse_response(sock)
+
+
+class TestAsyncClientWebSocket(TestCase):
+    
+    @staticmethod
+    def application(environ, start_response):
+        if 'wsgi.get_websocket' not in environ:
+            start_response('400 Not WebSocket', [])
+            return []
+        websocket = environ['wsgi.get_websocket']()
+        websocket.do_handshake()
+        while True:
+            message = websocket.receive()
+            if message is None:
+                break
+            websocket.send('echo' + message)
    
+
+    def setUp(self):
+        self.server = WebSocketServer(('127.0.0.1', 15001), self.application, policy_server=False)
+        self.server.start()
+        self.port = self.server.server_port
+
+
+    def tearDown(self):
+        timeout = gevent.Timeout(0.5,RuntimeError("Timeout trying to stop server"))
+        timeout.start()
+        try:
+            self.server.stop()
+        finally: timeout.cancel()
+
+
+    def test_connect(self):
+        try:
+            resp = AsyncClient().get('http://127.0.0.1:15001/')
+            print resp.read()
+        except HTTPException, e:
+            print "Caught Exception: %s, %s" % (e.status, e.reason)
+
+
+
+class TestAsyncClientChunked(TestCase):
+
+    @staticmethod
+    def application(env, start_response):
+        start_response('200 OK', [('Content-Type', 'text/plain')])
+        yield 'wsgi hello world'
+
+
+    def setUp(self):
+        self.application = validator(self.application)
+        self.server = pywsgi.WSGIServer(('127.0.0.1', 15001), self.application)
+        self.server.start()
+        self.port = self.server.server_port
+
+
+    def tearDown(self):
+        timeout = gevent.Timeout(0.5,RuntimeError("Timeout trying to stop server"))
+        timeout.start()
+        try:
+            self.server.stop()
+        finally:
+            timeout.cancel()
+
+
+    def test_connect(self):
+        resp = AsyncClient().get('http://127.0.0.1:15001/')
+        print resp.read()
+
 
 
 class TestAsyncClient(TestCase):
 
-    @staticmethod
-    def chunked_app(env, start_response):
-        start_response('200 OK', [('Content-Type', 'text/plain')])
-        yield 'wsgi hello world'
 
 
     @staticmethod
@@ -386,7 +460,7 @@ class TestAsyncClient(TestCase):
 
 
     def setUp(self):
-        self.application = validator(self.chunked_app)
+        self.application = validator(self.application)
         self.server = pywsgi.WSGIServer(('127.0.0.1', 15001), self.application)
         self.server.start()
         self.port = self.server.server_port
