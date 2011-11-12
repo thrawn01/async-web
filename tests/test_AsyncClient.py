@@ -8,7 +8,7 @@ from gevent import socket
 from gevent import pywsgi
 from gevent.server import StreamServer
 from StringIO import StringIO
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 import traceback
 import gevent
 import time
@@ -27,6 +27,18 @@ MONTH_NAME = [None,  # Dummy so we can use 1-based month numbers
 def http_date_time(timestamp):
     year, month, day, hh, mm, ss, wd, _y, _z = time.gmtime(timestamp)
     return "%s, %02d %3s %4d %02d:%02d:%02d GMT" % (WEEK_DAY_NAME[wd], day, MONTH_NAME[month], year, hh, mm, ss)
+
+
+def parse_uri(uri):
+    url = urlparse(uri)
+    port = int(url.port or 80)
+    path = url.path or '/'
+    scheme = url[0]
+    
+    if scheme == '':
+        raise RuntimeError("Failed to parse malformed URL")
+
+    return (scheme, url.hostname, port, path)
 
 
 def parse_header(file, debug=None):
@@ -95,17 +107,20 @@ def parse_chunk_header(file):
     return chunk_header
 
 
-def compose_status_line(version, status, reason):
+def compose_request_header(method, path='/', headers={}, version='HTTP/1.1'):
+    headers = ["%s: %s" % item for item in headers.items()]
+    return "%s %s %s\r\n%s\r\n\r\n" % (method, path, version,"\r\n".join(headers))
+
+
+def compose_response_header(version, status, reason, headers, _time=time.time()):
     if version != 11:
         raise RuntimeError("Response version is not HTTP/1.1; Only HTTP/1.1 is supported")
-    return ['HTTP/1.1 %s %s\r\n' % (status, reason),]
 
-
-def compose_header(headers, _time=time.time()):
     if 'Date' not in headers:
         headers['Date'] = http_date_time(_time)
 
-    return ['\r\n'.join(['%s: %s' % item for item in headers.items()]), '\r\n\r\n']
+    headers = ["%s: %s" % item for item in headers.items()]
+    return "HTTP/1.1 %s %s\r\n%s\r\n\r\n" % (status, reason,"\r\n".join(headers))
 
 
 def log_error(msg):
@@ -254,7 +269,7 @@ class HTTPSocket(object):
 
         try:
             length = self.headers['Content-Length']
-            # Server might respond with
+            # Server might respond with Content-Length of 0
             if length <= 0:
                 raise KeyError()
             return self.file.read(length)
@@ -280,12 +295,7 @@ class HTTPSocket(object):
                 self.headers['Content-Type'] = 'text/plain'
 
         # Compose the response
-        payload = compose_status_line(self.version, self.status, self.reason)
-        payload.extend(compose_header(self.headers))
-        payload.append(data)
-        #print "Payload ", payload
-        #print "Payload ", ''.join(payload)
-        return self.file.write(''.join(payload))
+        return self.file.write(compose_response_header(self.version, self.status, self.reason, self.headers))
 
 
 class Request(HTTPSocket):
@@ -310,23 +320,6 @@ class AsyncClient(object):
 
     def log(self, msg):
         sys.stderr.write(msg)
-
-
-    def parse_uri(self, uri):
-        url = urlparse(uri)
-        port = int(url.port or 80)
-        path = url.path or '/'
-        scheme = url[0]
-
-        if 'http' not in scheme:
-            raise RuntimeError("Only (http,https) supported")
-
-        return (scheme, url.hostname, port, path)
-
-
-    def _request_header(self, method, path='/', headers=(), version='HTTP/1.1'):
-        headers = [": ".join(x) for x in headers]
-        return "%s %s %s\r\n%s\r\n\r\n" % (method, path, version,"\r\n".join(headers))
 
 
     def _status_line(self, file, debug=None):
@@ -369,15 +362,33 @@ class AsyncClient(object):
         return Response(fd, headers, http_version=version, status=status, reason=reason)
 
         
-    def get(self, url, timeout=socket._GLOBAL_DEFAULT_TIMEOUT):
+    def get(self, uri, timeout=socket._GLOBAL_DEFAULT_TIMEOUT):
         # Parse the URI
-        (scheme, host, port, path) = self.parse_uri(url)
+        (scheme, host, port, path) = parse_uri(uri)
+
+        if 'http' != scheme:
+            raise RuntimeError("Only http:// Urls supported")
+
         # Connect to the remote Host
         sock = socket.create_connection((host, port), timeout=timeout)
         # Send the request header
-        sock.send(self._request_header('GET', path, (('Host',host),)))
+        sock.send(compose_request_header('GET', path, { 'Host': host }))
         # Parse the response and return a Request Object      
         return self._parse_response(sock)
+
+
+    def websocket(self, uri, timeout=socket._GLOBAL_DEFAULT_TIMEOUT):
+        # Parse the URI
+        (scheme, host, port, path) = parse_uri(uri)
+
+        if 'ws' != scheme:
+            raise RuntimeError("Only ws:// Urls supported")
+
+        # Connect to the remote Host
+        sock = socket.create_connection((host, port), timeout=timeout)
+        # Send the request header
+        sock.send(self.compose_websocket_header('GET', path, (('Host',host),)))
+        
 
 
 class TestAsyncClientWebSocket(TestCase):
@@ -451,8 +462,6 @@ class TestAsyncClientChunked(TestCase):
 
 class TestAsyncClient(TestCase):
 
-
-
     @staticmethod
     def application(env, start_response):
         start_response('200 OK', [('Content-Type', 'text/plain'),('Content-Length', '16')])
@@ -477,7 +486,7 @@ class TestAsyncClient(TestCase):
 
     def test_parse_uri(self):
         client = AsyncClient()
-        (scheme, host, port, path) = client.parse_uri("http://localhost:1500")
+        (scheme, host, port, path) = parse_uri("http://localhost:1500")
         self.assertEquals(scheme,'http')
         self.assertEquals(host,'localhost')
         self.assertEquals(port,1500)
@@ -486,14 +495,12 @@ class TestAsyncClient(TestCase):
 
     def test_parse_uri_raises(self):
         client = AsyncClient()
-        self.assertRaises(RuntimeError, client.parse_uri, ("ftp://localhost:1500"))
-        self.assertRaises(RuntimeError, client.parse_uri, (""))
-        self.assertRaises(RuntimeError, client.parse_uri, ("this is not a url"))
+        self.assertRaises(RuntimeError, parse_uri, (""))
+        self.assertRaises(RuntimeError, parse_uri, ("this is not a url"))
 
 
-    def test_request_header(self):
-        client = AsyncClient()
-        request = client._request_header('GET', path='/', headers=(('Host', 'localhost'),))
+    def test_compose_request_header(self):
+        request = compose_request_header('GET', path='/', headers={ 'Host': 'localhost' })
         self.assertEquals(request, 'GET / HTTP/1.1\r\nHost: localhost\r\n\r\n')
 
     def test_status_line(self):
@@ -534,11 +541,15 @@ class TestAsyncClient(TestCase):
                                            'Content-Length': 11,
                                            'Date': 'Fri, 28 Oct 2011 18:40:19 GMT' })
     
-    def test_create_header(self):
-        header = compose_header({ 'Always': 'GET,HEAD,POST' }, _time=1320269615.928314)
-        result = [ "Date: Wed, 02 Nov 2011 21:33:35 GMT\r\n" \
-                 "Always: GET,HEAD,POST", "\r\n\r\n"]
-        self.assertEquals(header, result)
+    def test_compose_request_header(self):
+        headers=OrderedDict({ 'Allow': 'GET,HEAD,POST' })
+        request = compose_response_header(11, 405, 'Method not allowed', headers, _time=1320269615.928314)
+        self.assertEquals(request, 'HTTP/1.1 405 Method not allowed\r\nAllow: GET,HEAD,POST\r\n'\
+                                    'Date: Wed, 02 Nov 2011 21:33:35 GMT\r\n\r\n')
+
+    def test_compose_response_header(self):
+        request = compose_request_header('GET', path='/', headers={ 'Host': 'localhost' })
+        self.assertEquals(request, 'GET / HTTP/1.1\r\nHost: localhost\r\n\r\n')
 
     def test_parse_header_raises(self):
 
