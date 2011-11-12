@@ -29,6 +29,10 @@ def http_date_time(timestamp):
     return "%s, %02d %3s %4d %02d:%02d:%02d GMT" % (WEEK_DAY_NAME[wd], day, MONTH_NAME[month], year, hh, mm, ss)
 
 
+def generate_nonce(self, salt):
+    return base64.b64encode(str(salt) + str(time.time() + (random.random() * 100000000000)))
+
+
 def parse_uri(uri):
     url = urlparse(uri)
     port = int(url.port or 80)
@@ -365,7 +369,6 @@ class AsyncClient(object):
     def get(self, uri, timeout=socket._GLOBAL_DEFAULT_TIMEOUT):
         # Parse the URI
         (scheme, host, port, path) = parse_uri(uri)
-
         if 'http' != scheme:
             raise RuntimeError("Only http:// Urls supported")
 
@@ -377,17 +380,34 @@ class AsyncClient(object):
         return self._parse_response(sock)
 
 
-    def websocket(self, uri, timeout=socket._GLOBAL_DEFAULT_TIMEOUT):
+    def websocket(self, uri, origin=None, timeout=socket._GLOBAL_DEFAULT_TIMEOUT):
         # Parse the URI
         (scheme, host, port, path) = parse_uri(uri)
-
         if 'ws' != scheme:
             raise RuntimeError("Only ws:// Urls supported")
 
+        if origin == None:
+            # XXX: Make a proper origin one day
+            origin = '%s://%s:%s' % (scheme, host, port)
+
         # Connect to the remote Host
         sock = socket.create_connection((host, port), timeout=timeout)
+        # Generate the key/nonce used in handshake 
+        self.key = generate_nonce(sock.fileno())
+
+        # WebSocket Headers
+        headers = {
+            'Host': host,
+            'Upgrade': 'websocket',
+            'Connection': 'Upgrade',
+            'Origin': origin,
+            'Sec-WebSocket-Version': '13',
+            'Sec-WebSocket-Protocol': 'chat',
+            'Sec-WebSocket-Key': self.key,
+        }
+
         # Send the request header
-        sock.send(self.compose_websocket_header('GET', path, (('Host',host),)))
+        sock.send(self.compose_request_header('GET', path, headers))
         
 
 
