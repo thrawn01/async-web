@@ -10,13 +10,16 @@ from gevent.server import StreamServer
 from StringIO import StringIO
 from collections import defaultdict, OrderedDict
 import traceback
+import hashlib
 import gevent
 import time
 import sys
 
+# XXX: Remove later
 from websocket.server import WebSocketServer
 
 MAX_LINE_LENGTH = 8192
+WEBSOCKET_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
 SUPPORTED_METHODS = ('GET', 'POST', 'PUT', 'DELETE', 'TRACE', 'OPTIONS', 'HEAD')
 
 # Weekday and month names for HTTP date/time formatting
@@ -71,7 +74,7 @@ def parse_header(file, debug=None):
             raise HTTPException(400, 'Malformed header found; %s' % header_line)
         
         # Strip the white space around the key and value
-        key = key.strip(); value = value.strip()
+        key = key.strip().lower(); value = value.strip()
 
         # This doesn't seam performant but is. See Commit 3fa292cf and 38b8c18e8
         if key in headers:
@@ -83,11 +86,11 @@ def parse_header(file, debug=None):
             headers[key] = value
         
         try:
-            headers['Content-Length'] = int(headers['Content-Length'])
+            headers['content-length'] = int(headers['content-length'])
         except ValueError:
-            raise HTTPException(400, 'Invalid value for "Content-Length" header; %s' % headers['content-length'][0])
+            raise HTTPException(400, 'Invalid value for "content-length" header; %s' % headers['content-length'][0])
         except KeyError:
-            # Missing Content-Length is ok, it might be a chunked response
+            # Missing content-length is ok, it might be a chunked response
             pass
 
     return headers
@@ -116,6 +119,11 @@ def compose_request_header(method, path='/', headers={}, version='HTTP/1.1'):
     return "%s %s %s\r\n%s\r\n\r\n" % (method, path, version,"\r\n".join(headers))
 
 
+def capitalize(item):
+    capitalized_key = '-'.join([char.capitalize() for char in item[0].split('-')])
+    return (capitalized_key, item[1])
+    
+
 def compose_response_header(version, status, reason, headers, _time=time.time()):
     if version != 11:
         raise RuntimeError("Response version is not HTTP/1.1; Only HTTP/1.1 is supported")
@@ -123,7 +131,7 @@ def compose_response_header(version, status, reason, headers, _time=time.time())
     if 'Date' not in headers:
         headers['Date'] = http_date_time(_time)
 
-    headers = ["%s: %s" % item for item in headers.items()]
+    headers = ["%s: %s" % capitalize(item) for item in headers.items()]
     return "HTTP/1.1 %s %s\r\n%s\r\n\r\n" % (status, reason,"\r\n".join(headers))
 
 
@@ -215,6 +223,73 @@ class AsyncServer(StreamServer):
         response.write('')    
 
 
+class WebSocket(object):
+    """ Websocket filter for hybi draft websocket protocol """
+   
+    def __init__(self):
+        self.routes = {}
+
+
+    # XXX Add real path route handling
+    def add(self, path, handler):
+        self.routes[path] = handler
+
+
+    def valid_origin(self, origin):
+        # XXX: Fix me
+        return True
+
+
+    def parse_handshake(self, headers):
+        protocols = []
+        extensions = []
+
+        # draft-ietf-hybi-thewebsocketprotocol-17 Section 4.2.2
+        # Extensions and Protocols can be empty or non-existant
+        
+        if 'sec-websocket-protocol' in headers:
+            protocols = headers['sec-websocket-protocol'].split(',')
+            
+        if 'sec-websocket-extensions' in headers:
+            extensions = headers['sec-websocket-extensions'].split(',')
+
+        try:
+            # Validate the correct version is requested
+            if headers['sec-websocket-version'].strip() != '13':
+                raise HTTPException(426, 'Server only supports WebSocket Version 13')
+           
+            if not self.valid_origin(headers['origin']):
+                raise HTTPException(403, 'Invalid Origin, not allowed')
+            
+            return (headers['sec-websocket-key'], protocols, extensions)
+
+        except KeyError:
+            raise HTTPException(400, 'Incomplete or Malformed Websocket handshake')
+
+
+    def __call__(self, request, response, _next):
+        # Validate an parse the handshake
+        (key, protocols, extensions) = self.parse_handshake(request.headers)
+        
+        # From draft-ietf-hybi-thewebsocketprotocol-17 Section-1.3
+        # Concat the key and the GUID, then SHA-1 Hash the Concat, then Base 64 Encode
+        return_key = base64.b64encode(hashlib.sha1(key + WEBSOCKET_GUID).digest())
+       
+        # Set our return code and reason
+        response.set(status = 101, reason = 'Switching Protocols')
+        headers = {
+            'Upgrade': 'websocket',
+            'Connection': 'Upgrade',
+            'Sec-WebSocket-Accept': return_key
+        }
+        # Send the Handshake response 
+        response.write('')
+        
+        # Match the path with a handler, and start handling websocket messages
+        self.routes[path](request, response)
+        return _next(request, response)
+    
+
 
 class HTTPSocket(object):
 
@@ -239,13 +314,14 @@ class HTTPSocket(object):
 
     def read(self, callback=None):
         # XXX: Check for values to read, don't want to block if the user calls us again
+        # XXX: Remove callback here
 
         try:
             # RFC2616 Sec 4.4
             # If a Transfer-Encoding header field (section 14.41) is present and has any value other than "identity", 
             # then the transfer-length is defined by use of the "chunked" transfer-coding (section 3.6), 
             # unless the message is terminated by closing the connection. 
-            if self.headers['Transfer-Encoding'] != 'identity':
+            if self.headers['transfer-encoding'] != 'identity':
                 if self.file.closed: # XXX Does a file object know when a socket is closed?
                     raise KeyError() # Forces a non-chunked read
 
@@ -272,8 +348,8 @@ class HTTPSocket(object):
             pass
 
         try:
-            length = self.headers['Content-Length']
-            # Server might respond with Content-Length of 0
+            length = self.headers['content-length']
+            # Server might respond with content-length of 0
             if length <= 0:
                 raise KeyError()
             return self.file.read(length)
@@ -282,7 +358,7 @@ class HTTPSocket(object):
             if self.status != 200:
                 raise HTTPException(self.status, self.reason)
             # Else the server responded incorrectly
-            raise RuntimeError("Unable to read response; missing 'Content-Length' header or 'Content-Length' is 0 and 'Transfer-Encoding' is not 'chunked'")
+            raise RuntimeError("Unable to read response; missing 'content-length' header or 'content-length' is 0 and 'Transfer-Encoding' is not 'chunked'")
 
         # XXX: Check for 'Connection: close' header if it exists, close the connection here
 
@@ -293,7 +369,7 @@ class HTTPSocket(object):
         # Un-Chunked response
         length = len(data)
         if length != 0:
-            self.headers['Content-Length'] = length
+            self.headers['content-length'] = length
             # Alway default to text/plain if Content-Type not specified
             if 'Content-Type' not in self.headers:
                 self.headers['Content-Type'] = 'text/plain'
@@ -484,7 +560,7 @@ class TestAsyncClient(TestCase):
 
     @staticmethod
     def application(env, start_response):
-        start_response('200 OK', [('Content-Type', 'text/plain'),('Content-Length', '16')])
+        start_response('200 OK', [('Content-Type', 'text/plain'),('content-length', '16')])
         return ['wsgi hello world']
 
 
@@ -557,9 +633,9 @@ class TestAsyncClient(TestCase):
         file = StringIO('Content-Type: text/plain\r\nContent-Length: 11\r\nDate: Fri, 28 Oct 2011 18:40:19 GMT\r\n\r\n')
 
         headers = parse_header(file)
-        self.assertEquals(dict(headers), { 'Content-Type': 'text/plain',
-                                           'Content-Length': 11,
-                                           'Date': 'Fri, 28 Oct 2011 18:40:19 GMT' })
+        self.assertEquals(dict(headers), { 'content-type': 'text/plain',
+                                           'content-length': 11,
+                                           'date': 'Fri, 28 Oct 2011 18:40:19 GMT' })
     
     def test_compose_request_header(self):
         headers=OrderedDict({ 'Allow': 'GET,HEAD,POST' })
@@ -578,13 +654,13 @@ class TestAsyncClient(TestCase):
         self.assertRaises(HTTPException, parse_header, StringIO(long_header))
         
         # Should raise on incorrectly terminated headers
-        file = StringIO('Content-Type: text/plain\r\nContent-Length: 11\r\nDate: Fri, 28 Oct 2011 18:40:19 GMT\r\n')
+        file = StringIO('Content-Type: text/plain\r\ncontent-length: 11\r\nDate: Fri, 28 Oct 2011 18:40:19 GMT\r\n')
         self.assertRaises(HTTPException, parse_header, file)
-        file = StringIO('Content-Type: text/plain\r\nContent-Length: 11\r\nDate: Fri, 28 Oct 2011 18:40:19 GMT')
+        file = StringIO('Content-Type: text/plain\r\ncontent-length: 11\r\nDate: Fri, 28 Oct 2011 18:40:19 GMT')
         self.assertRaises(HTTPException, parse_header, file)
         
         # Should raise on malformed, garbage headers
-        file = StringIO('Content-Type- text/plain\r\nContent-LengthASDF#$^@#$G@#G#@%H@#$BH@#$#$')
+        file = StringIO('Content-Type- text/plain\r\ncontent-lengthASDF#$^@#$G@#G#@%H@#$BH@#$#$')
         self.assertRaises(HTTPException, parse_header, file)
 
 
@@ -597,8 +673,8 @@ class TestAsyncClient(TestCase):
 class TestResponse(TestCase):
 
     def test_constructor(self):
-        resp = Response(StringIO(''), {'Content-Length': 11, 'Param':['1','2']}, http_version=11, status=200, reason='OK')
-        self.assertEquals(resp.headers, {'Content-Length': 11, 'Param':['1','2']} )
+        resp = Response(StringIO(''), {'content-length': 11, 'Param':['1','2']}, http_version=11, status=200, reason='OK')
+        self.assertEquals(resp.headers, {'content-length': 11, 'Param':['1','2']} )
         self.assertEquals(resp.http_version, 11)
         self.assertEquals(resp.status, 200)
         self.assertEquals(resp.reason, 'OK')
@@ -642,6 +718,27 @@ class TestAsyncServer(TestCase):
         server = AsyncServer(('127.0.0.1', 15001), (self.routes,))
         server.start()
         
+        try:
+            resp = AsyncClient().get('http://127.0.0.1:15001/')
+            print resp.read()
+        except HTTPException, e:
+            print "Status: %s Reason: %s" % (e.status, e.reason)
+
+        self.stop(server)
+
+
+    def web_socket_handler(self, request, response):
+        response.write("hello world")
+
+
+    def test_websocket(self):
+        web_socket = WebSocket()
+        web_socket.add('/', self.web_socket_handler)
+
+        ## Create a simple server with a WebSocket filter that responds with 'Hello World'
+        server = AsyncServer(('127.0.0.1', 15001), (web_socket,))
+        server.start()
+
         try:
             resp = AsyncClient().get('http://127.0.0.1:15001/')
             print resp.read()
