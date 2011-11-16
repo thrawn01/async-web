@@ -9,11 +9,8 @@ from gevent import pywsgi
 from gevent.server import StreamServer
 from StringIO import StringIO
 from collections import defaultdict, OrderedDict
-import traceback
-import hashlib
+import hashlib, base64, random, traceback, time, sys, os
 import gevent
-import time
-import sys
 
 # XXX: Remove later
 from websocket.server import WebSocketServer
@@ -32,10 +29,6 @@ def http_date_time(timestamp):
     return "%s, %02d %3s %4d %02d:%02d:%02d GMT" % (WEEK_DAY_NAME[wd], day, MONTH_NAME[month], year, hh, mm, ss)
 
 
-def generate_nonce(self, salt):
-    return base64.b64encode(str(salt) + str(time.time() + (random.random() * 100000000000)))
-
-
 def parse_uri(uri):
     url = urlparse(uri)
     port = int(url.port or 80)
@@ -46,6 +39,57 @@ def parse_uri(uri):
         raise RuntimeError("Failed to parse malformed URL")
 
     return (scheme, url.hostname, port, path)
+
+
+def parse_request_line(file):
+    # Read the first line of the request ( should be the status-line )
+    line = file.readline(MAX_LINE_LENGTH + 1)
+    # If the status-line is to large, it's bogus
+    if len(line) > MAX_LINE_LENGTH:
+        raise RuntimeError('Refusing to parse extremely long status-line; %s' % line )
+
+    try:
+        # If the line does not conform to accepted status line, split or the unpack should let us know
+        (method, path, http_version) = line.split(None,2)
+    except ValueError:
+        raise RuntimeError('Invalid HTTP/1.1 status line in request header; %s' % line)
+    
+    if not http_version.startswith('HTTP/1.1'):
+        raise RuntimeError('Client requested unsupported HTTP Version; Only HTTP/1.1 supported')
+    
+    if method not in SUPPORTED_METHODS:
+        raise HTTPException(405, "Client requested un-supported method in HTTP/1.1 status line; %s" % line)
+
+    return (method, path, 11)
+
+
+def parse_response_line(file, debug=None):
+    # Read the first line of the response ( should be the status-line )
+    line = file.readline(MAX_LINE_LENGTH + 1)
+    # If the status-line is to large, it's bogus
+    if len(line) > MAX_LINE_LENGTH:
+        raise RuntimeError('Refusing to parse extremely long status-line; %s' % line )
+    
+    if debug: debug.write('-- status: %s' % line)
+
+    try:
+        # If the line does not conform to accepted status line, split or the unpack should let us know
+        (http_version, status_code, reason_phrase) = line.split(None,2)
+    except ValueError:
+        raise RuntimeError('Invalid HTTP/1.1 status line in response header; %s' % line)
+    
+    if http_version != 'HTTP/1.1':
+        raise RuntimeError('Server responded with unsupported HTTP Version; Only HTTP/1.1 supported')
+    
+    try:
+        # Although RFC2616 Only mentions 100 through 505, Extensions could utilize up to 999
+        status_code = int(status_code)
+        if status_code < 100 or status_code > 999:
+            raise ValueError()
+    except ValueError:
+        raise RuntimeError("Invalid status code in HTTP/1.1 status line; %s" % line)
+    
+    return (11, status_code, reason_phrase.rstrip())
 
 
 def parse_header(file, debug=None):
@@ -164,36 +208,14 @@ class AsyncServer(StreamServer):
         return (request, response) 
 
 
-    def _status_line(self, file):
-        # Read the first line of the response ( should be the status-line )
-        line = file.readline(MAX_LINE_LENGTH + 1)
-        # If the status-line is to large, it's bogus
-        if len(line) > MAX_LINE_LENGTH:
-            raise RuntimeError('Refusing to parse extremely long status-line; %s' % line )
-
-        try:
-            # If the line does not conform to accepted status line, split or the unpack should let us know
-            (method, path, http_version) = line.split(None,2)
-        except ValueError:
-            raise RuntimeError('Invalid HTTP/1.1 status line in request header; %s' % line)
-        
-        if not http_version.startswith('HTTP/1.1'):
-            raise RuntimeError('Client requested unsupported HTTP Version; Only HTTP/1.1 supported')
-        
-        if method not in SUPPORTED_METHODS:
-            raise HTTPException(405, "Client requested un-supported method in HTTP/1.1 status line; %s" % line)
-
-        return (method, path, 11)
-        
-
     def handle(self, sock, address):
         # Use a file like object so we can use readline()
         fd = sock.makefile('fb')
         # Create the Response Object
         response = Response(fd, {}, version=11, status=200, reason='OK')
         try:
-            # Parse the status line 
-            (method, path, version) = self._status_line(fd)
+            # Parse the request line 
+            (method, path, version) = parse_request_line(fd)
             # Parse the response headers
             headers = parse_header(fd)
             # Create the Request Object
@@ -248,45 +270,45 @@ class WebSocket(object):
         # Extensions and Protocols can be empty or non-existant
         
         if 'sec-websocket-protocol' in headers:
-            protocols = headers['sec-websocket-protocol'].split(',')
-            
+            protocols = [protocol.strip() for protocol in headers["sec-websocket-protocol"].split(',')]
         if 'sec-websocket-extensions' in headers:
-            extensions = headers['sec-websocket-extensions'].split(',')
+            extensions = [extension.strip() for extension in headers["sec-websocket-extensions"].split(',')]
 
         try:
             # Validate the correct version is requested
             if headers['sec-websocket-version'].strip() != '13':
                 raise HTTPException(426, 'Server only supports WebSocket Version 13')
            
-            if not self.valid_origin(headers['origin']):
-                raise HTTPException(403, 'Invalid Origin, not allowed')
-            
-            return (headers['sec-websocket-key'], protocols, extensions)
+            key = headers['sec-websocket-key']
+            if len(key) != 24:
+                raise HTTPException(403, 'Invalid base64 encoding for Sec-WebSocket-Key')
+
+            return (key, protocols, extensions, headers['origin'].strip())
 
         except KeyError:
             raise HTTPException(400, 'Incomplete or Malformed Websocket handshake')
 
 
     def __call__(self, request, response, _next):
-        # Validate an parse the handshake
-        (key, protocols, extensions) = self.parse_handshake(request.headers)
+        # Validate and parse the handshake
+        (key, protocols, extensions, origin) = self.parse_handshake(request.headers)
         
         # From draft-ietf-hybi-thewebsocketprotocol-17 Section-1.3
         # Concat the key and the GUID, then SHA-1 Hash the Concat, then Base 64 Encode
-        return_key = base64.b64encode(hashlib.sha1(key + WEBSOCKET_GUID).digest())
+        key = base64.b64encode(hashlib.sha1(key + WEBSOCKET_GUID).digest())
        
         # Set our return code and reason
         response.set(status = 101, reason = 'Switching Protocols')
-        headers = {
+        response.headers = {
             'Upgrade': 'websocket',
             'Connection': 'Upgrade',
-            'Sec-WebSocket-Accept': return_key
+            'Sec-WebSocket-Accept': key
         }
         # Send the Handshake response 
         response.write('')
         
         # Match the path with a handler, and start handling websocket messages
-        self.routes[path](request, response)
+        self.routes[request.path](request, response)
         return _next(request, response)
     
 
@@ -402,40 +424,11 @@ class AsyncClient(object):
         sys.stderr.write(msg)
 
 
-    def _status_line(self, file, debug=None):
-        # Read the first line of the response ( should be the status-line )
-        line = file.readline(MAX_LINE_LENGTH + 1)
-        # If the status-line is to large, it's bogus
-        if len(line) > MAX_LINE_LENGTH:
-            raise RuntimeError('Refusing to parse extremely long status-line; %s' % line )
-        
-        if debug: debug.write('-- status: %s' % line)
-
-        try:
-            # If the line does not conform to accepted status line, split or the unpack should let us know
-            (http_version, status_code, reason_phrase) = line.split(None,2)
-        except ValueError:
-            raise RuntimeError('Invalid HTTP/1.1 status line in response header; %s' % line)
-        
-        if http_version != 'HTTP/1.1':
-            raise RuntimeError('Server responded with unsupported HTTP Version; Only HTTP/1.1 supported')
-        
-        try:
-            # Although RFC2616 Only mentions 100 through 505, Extensions could utilize up to 999
-            status_code = int(status_code)
-            if status_code < 100 or status_code > 999:
-                raise ValueError()
-        except ValueError:
-            raise RuntimeError("Invalid status code in HTTP/1.1 status line; %s" % line)
-        
-        return (11, status_code, reason_phrase.rstrip())
-
-
-    def _parse_response(self, sock):
+    def _parse_server_response(self, sock):
         # Use a file like object so we can use readline()
         fd = sock.makefile('fb')
         # Parse the status line 
-        (version, status, reason) = self._status_line(fd, sys.stderr)
+        (version, status, reason) = parse_response_line(fd, sys.stderr)
         # Parse the response headers
         headers = parse_header(fd, sys.stderr)
         # Instanciate the user object Response()
@@ -453,23 +446,22 @@ class AsyncClient(object):
         # Send the request header
         sock.send(compose_request_header('GET', path, { 'Host': host }))
         # Parse the response and return a Request Object      
-        return self._parse_response(sock)
+        return self._parse_server_response(sock)
 
 
     def websocket(self, uri, origin=None, timeout=socket._GLOBAL_DEFAULT_TIMEOUT):
         # Parse the URI
         (scheme, host, port, path) = parse_uri(uri)
-        if 'ws' != scheme:
-            raise RuntimeError("Only ws:// Urls supported")
+        #if 'ws' != scheme:
+            #raise RuntimeError("Only ws:// Urls supported")
 
         if origin == None:
-            # XXX: Make a proper origin one day
             origin = '%s://%s:%s' % (scheme, host, port)
 
         # Connect to the remote Host
         sock = socket.create_connection((host, port), timeout=timeout)
         # Generate the key/nonce used in handshake 
-        self.key = generate_nonce(sock.fileno())
+        key = base64.b64encode(os.urandom(16))
 
         # WebSocket Headers
         headers = {
@@ -479,12 +471,33 @@ class AsyncClient(object):
             'Origin': origin,
             'Sec-WebSocket-Version': '13',
             'Sec-WebSocket-Protocol': 'chat',
-            'Sec-WebSocket-Key': self.key,
+            'Sec-WebSocket-Key': key,
         }
 
-        # Send the request header
-        sock.send(self.compose_request_header('GET', path, headers))
+        # Send the request header that starts the handshake
+        sock.send(compose_request_header('GET', path, headers))
+        # Parse the response
+        response = self._parse_server_response(sock)
+
+        # Did the server respond with 101?
+        if response.status != 101:
+            raise HTTPException(response.status, 'Server responded with un-expected status; expected 101')
         
+        # From draft-ietf-hybi-thewebsocketprotocol-17 Section-1.3
+        # Concat the key and the GUID, then SHA-1 Hash the Concat, then Base 64 Encode
+        expected_key = base64.b64encode(hashlib.sha1(key + WEBSOCKET_GUID).digest())
+        headers = response.headers
+        try:
+            if headers['upgrade'].lower() != 'websocket':
+                raise RuntimeError('Update has invalid value; expected "websocket" got "%s"' % headers['upgrade'])
+            if headers['connection'].lower() != 'upgrade':
+                raise RuntimeError('Connection has invalid value; expected "upgrade" got "%s"' % headers['connection'])
+            if headers['sec-websocket-accept'] != expected_key:
+                raise RuntimeError('Sec-WebSocket-Accept has invalid value; expected "%s" got "%s"' % (expected_key, headers['sec-websocket-accept']))
+        except KeyError:
+            raise RuntimeError('Missing headers in response; expected (upgrade, connection, sec-websocket-accept) got (%s)' % ','.join(headers.keys()))
+             
+        return response
 
 
 class TestAsyncClientWebSocket(TestCase):
@@ -601,7 +614,7 @@ class TestAsyncClient(TestCase):
 
     def test_status_line(self):
         client = AsyncClient()
-        (version, status, reason) = client._status_line(StringIO('HTTP/1.1 200 OK\r\n'))
+        (version, status, reason) = parse_response_line(StringIO('HTTP/1.1 200 OK\r\n'))
         self.assertEquals(version, 11)
         self.assertEquals(status, 200)
         self.assertEquals(reason, 'OK')
@@ -611,23 +624,23 @@ class TestAsyncClient(TestCase):
 
         # Should raise on long status line
         long_line = ''.join([ ' ' for x in range(1,1500) ])
-        self.assertRaises(RuntimeError, client._status_line, StringIO(long_line))
+        self.assertRaises(RuntimeError, parse_response_line, StringIO(long_line))
         
         # Should raise on garbage status lines
-        self.assertRaises(RuntimeError, client._status_line, StringIO('HTTP/1.1-200-OK\r\n'))
-        self.assertRaises(RuntimeError, client._status_line, StringIO('blahblah'))
-    
+        self.assertRaises(RuntimeError, parse_response_line, StringIO('HTTP/1.1-200-OK\r\n'))
+        self.assertRaises(RuntimeError, parse_response_line, StringIO('blahblah'))
+
         # Should raise on wrong HTTP version
-        self.assertRaises(RuntimeError, client._status_line, StringIO('HTTP/1.0 200 OK\r\n'))
-        self.assertRaises(RuntimeError, client._status_line, StringIO('HTTP/0.9 200 OK\r\n'))
-        
+        self.assertRaises(RuntimeError, parse_response_line, StringIO('HTTP/1.0 200 OK\r\n'))
+        self.assertRaises(RuntimeError, parse_response_line, StringIO('HTTP/0.9 200 OK\r\n'))
+
         # Should raise on invalid status code
-        self.assertRaises(RuntimeError, client._status_line, StringIO('HTTP/1.1 2001 OK\r\n'))
-        self.assertRaises(RuntimeError, client._status_line, StringIO('HTTP/1.1 000 UhOh\r\n'))
+        self.assertRaises(RuntimeError, parse_response_line, StringIO('HTTP/1.1 2001 OK\r\n'))
+        self.assertRaises(RuntimeError, parse_response_line, StringIO('HTTP/1.1 000 UhOh\r\n'))
 
         # Should raise on missing values
-        self.assertRaises(RuntimeError, client._status_line, StringIO('HTTP/1.1 200 \r\n'))
-        self.assertRaises(RuntimeError, client._status_line, StringIO('200 OK\r\n'))
+        self.assertRaises(RuntimeError, parse_response_line, StringIO('HTTP/1.1 200 \r\n'))
+        self.assertRaises(RuntimeError, parse_response_line, StringIO('200 OK\r\n'))
 
     def test_parse_header(self):
         file = StringIO('Content-Type: text/plain\r\nContent-Length: 11\r\nDate: Fri, 28 Oct 2011 18:40:19 GMT\r\n\r\n')
@@ -740,8 +753,8 @@ class TestAsyncServer(TestCase):
         server.start()
 
         try:
-            resp = AsyncClient().get('http://127.0.0.1:15001/')
-            print resp.read()
+            socket = AsyncClient().websocket('http://127.0.0.1:15001/')
+            print socket.read()
         except HTTPException, e:
             print "Status: %s Reason: %s" % (e.status, e.reason)
 
