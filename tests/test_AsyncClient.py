@@ -277,8 +277,10 @@ class WebSocket(object):
         try:
             # Validate the correct version is requested
             if headers['sec-websocket-version'].strip() != '13':
+                # XXX Respond with a list of acceptable versions 'Sec-WebSocket-Version: 8, 7'
                 raise HTTPException(426, 'Server only supports WebSocket Version 13')
            
+            # XXX Scrub the incoming KEY for possible attacks against b64encode() or sha1()
             key = headers['sec-websocket-key']
             if len(key) != 24:
                 raise HTTPException(403, 'Invalid base64 encoding for Sec-WebSocket-Key')
@@ -292,7 +294,7 @@ class WebSocket(object):
     def __call__(self, request, response, _next):
         # Validate and parse the handshake
         (key, protocols, extensions, origin) = self.parse_handshake(request.headers)
-        
+
         # From draft-ietf-hybi-thewebsocketprotocol-17 Section-1.3
         # Concat the key and the GUID, then SHA-1 Hash the Concat, then Base 64 Encode
         key = base64.b64encode(hashlib.sha1(key + WEBSOCKET_GUID).digest())
@@ -304,7 +306,7 @@ class WebSocket(object):
             'Connection': 'Upgrade',
             'Sec-WebSocket-Accept': key
         }
-        # Send the Handshake response 
+        # XXX: **Remove?**, shouldn't the handler do this for us?
         response.write('')
         
         # Match the path with a handler, and start handling websocket messages
@@ -481,13 +483,19 @@ class AsyncClient(object):
 
         # Did the server respond with 101?
         if response.status != 101:
+            # XXX Handle redirects 3xx responses
             raise HTTPException(response.status, 'Server responded with un-expected status; expected 101')
         
+
+        # XXX Scrub the incoming KEY for possible attacks against b64encode() or sha1()
+
         # From draft-ietf-hybi-thewebsocketprotocol-17 Section-1.3
         # Concat the key and the GUID, then SHA-1 Hash the Concat, then Base 64 Encode
         expected_key = base64.b64encode(hashlib.sha1(key + WEBSOCKET_GUID).digest())
         headers = response.headers
         try:
+            # XXX Did the server respond with a protocol we didn't ask for?
+
             if headers['upgrade'].lower() != 'websocket':
                 raise RuntimeError('Update has invalid value; expected "websocket" got "%s"' % headers['upgrade'])
             if headers['connection'].lower() != 'upgrade':
@@ -754,9 +762,19 @@ class TestAsyncServer(TestCase):
 
         try:
             socket = AsyncClient().websocket('http://127.0.0.1:15001/')
-            print socket.read()
+
+            self.assertEquals(socket.headers['connection'], 'Upgrade')
+            self.assertEquals(socket.headers['upgrade'], 'websocket')
+            self.assertIn('date', socket.headers)
+            self.assertIn('sec-websocket-accept', socket.headers)
+            self.assertEquals(socket.status, 101)
+            self.assertEquals(socket.reason, 'Switching Protocols')
+
+            self.assertEquals(socket.read(),'hello world')
+
         except HTTPException, e:
             print "Status: %s Reason: %s" % (e.status, e.reason)
 
         self.stop(server)
 
+    
