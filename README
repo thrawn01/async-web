@@ -14,3 +14,8 @@ sudo make install
 pip install greenlet
 pip install gevent
 
+# XXX: Remove later
+hg clone https://bitbucket.org/denis/websocket
+cd websocket
+python setup.py install 
+
