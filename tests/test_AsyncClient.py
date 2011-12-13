@@ -313,7 +313,28 @@ class WebSocket(object):
         # Match the path with a handler, and start handling websocket messages
         self.routes[request.path](request, response)
         return _next(request, response)
-    
+
+
+    def parseFrameHeader(self, read):
+        # Read the 2 byte frame header
+        # XXX: read() should throw on error
+        header = unpack_from('!H', read(2))
+        # Last 7 bits of the header consitute the length
+        length = header & 0x7F
+        # If the length is 126, unpack the next 2 bytes
+        if length == 126:
+            return (unpack_from('!H', read(2)), header)
+        # If the length is 127, unpack the next 8 bytes
+        if length == 127:
+            return (unpack_from('!L', read(8)), header)
+        return (length, header)
+
+
+    def read(self, read=self.response.read):
+        # Parse the frame header
+        (length, header) = self.parseFrameHeader(header, read)
+        # Read in the entire frame
+        frame = read(length)
 
 
 class HTTPSocket(object):
