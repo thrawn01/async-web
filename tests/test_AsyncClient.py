@@ -8,8 +8,8 @@ from gevent import socket
 from gevent import pywsgi
 from gevent.server import StreamServer
 from StringIO import StringIO
-from collections import defaultdict
-import hashlib, base64, random, traceback, time, sys, os
+from collections import defaultdict, namedtuple
+import hashlib, base64, random, traceback, time, sys, os, struct
 from utils import OrderedDict
 import gevent
 
@@ -71,7 +71,7 @@ def parse_response_line(file, debug=None):
     if len(line) > MAX_LINE_LENGTH:
         raise RuntimeError('Refusing to parse extremely long status-line; %s' % line )
     
-    if debug: debug.write('-- status: %s' % line)
+    if debug: debug.write('-- status: "%s"' % line)
 
     try:
         # If the line does not conform to accepted status line, split or the unpack should let us know
@@ -177,6 +177,7 @@ def compose_response_header(version, status, reason, headers, _time=time.time())
         headers['Date'] = http_date_time(_time)
 
     headers = ["%s: %s" % capitalize(item) for item in headers.items()]
+    print "------- HTTP/1.1 %s %s\r\n%s\r\n\r\n" % (status, reason,"\r\n".join(headers))
     return "HTTP/1.1 %s %s\r\n%s\r\n\r\n" % (status, reason,"\r\n".join(headers))
 
 
@@ -231,6 +232,12 @@ class AsyncServer(StreamServer):
             log_error(traceback.format_exc())
             # Inform the client of the error
             self.errors(response, 500, "Internal Server Error")
+            # XXX: Close the connection 
+            try:
+                sock._sock.close()  # do not rely on garbage collection
+                sock.close()
+            except socket.error:
+                pass
 
 
     def errors(self, response, status, reason):
@@ -243,8 +250,12 @@ class AsyncServer(StreamServer):
         if status == 405:
             response.headers = { 'Allow': ','.join(SUPPORTED_METHODS) }
         
-        response.write('')    
+        response._write('')
 
+
+# Create a Named Tuple (Class)
+Frame = namedtuple('Frame', ['data', 'header', 'extended'])
+    
 
 class WebSocket(object):
     """ Websocket filter for hybi draft websocket protocol """
@@ -292,6 +303,7 @@ class WebSocket(object):
             raise HTTPException(400, 'Incomplete or Malformed Websocket handshake')
 
 
+    # XXX: Catch all our errors here, do not allow exceptions to fall through for websockets
     def __call__(self, request, response, _next):
         # Validate and parse the handshake
         (key, protocols, extensions, origin) = self.parse_handshake(request.headers)
@@ -307,34 +319,71 @@ class WebSocket(object):
             'Connection': 'Upgrade',
             'Sec-WebSocket-Accept': key
         }
-        # XXX: **Remove?**, shouldn't the handler do this for us?
+        # Do this so we don't have a partial handshake, as the handler might 
+        # wait for requests instead of issuing a response
         response.write('')
-        
+      
+        # Replace write with our version of write
+        response.write = lambda data: self.write(data, response.write)
+
         # Match the path with a handler, and start handling websocket messages
         self.routes[request.path](request, response)
         return _next(request, response)
 
 
-    def parseFrameHeader(self, read):
+    def parseFrame(self, read):
         # Read the 2 byte frame header
-        # XXX: read() should throw on error
         header = unpack_from('!H', read(2))
         # Last 7 bits of the header consitute the length
         length = header & 0x7F
-        # If the length is 126, unpack the next 2 bytes
+
         if length == 126:
-            return (unpack_from('!H', read(2)), header)
-        # If the length is 127, unpack the next 8 bytes
+            # If the length is 126, unpack the next 2 bytes
+            length = unpack_from('!H', read(2))
+
         if length == 127:
-            return (unpack_from('!L', read(8)), header)
-        return (length, header)
+            # If the length is 127, unpack the next 8 bytes
+            length = unpack_from('!L', read(8))
 
-
-    def read(self, read=self.response.read):
-        # Parse the frame header
-        (length, header) = self.parseFrameHeader(header, read)
         # Read in the entire frame
-        frame = read(length)
+        return Frame(read(length), header, length)
+
+
+    def composeFrame(self, data):
+        (header, extended, length) = (0, 0, len(data))
+
+        # XXX: This code assumes only 64-bit integers are possible on this platform
+        # If length is larger then 16bit unsigned
+        if length > 65535:
+            # Pack length as a 64-bit unsigned
+            extended = struct.pack("!Q", length)
+            header = 127
+        # If length is larger then 8 bit unsigned
+        elif length >= 126:
+            # Pack length as a 16-bit unsigned
+            extended = struct.pack("!H", length)
+            header = 126
+        else:
+            header = length
+
+        # XXX: Add addtional flags to the header here
+
+        return Frame(data, struct.pack("!cc", header), extended)
+
+    
+    def read(self, read):
+        # Parse the frame into a tuple
+        frame = self.parseFrame(read)
+        # Return the data in the frame
+        return frame
+
+
+    def write(self, data, write):
+        # Create a frame as a tuple
+        frame = self.composeFrame(data)
+        # Join the tuple and write the result
+        write(''.join(payload)) 
+
 
 
 class HTTPSocket(object):
@@ -358,7 +407,7 @@ class HTTPSocket(object):
             setattr(self, key, value)
 
 
-    def read(self, callback=None):
+    def _read(self, callback=None):
         # XXX: Check for values to read, don't want to block if the user calls us again
         # XXX: Remove callback here
 
@@ -409,8 +458,7 @@ class HTTPSocket(object):
         # XXX: Check for 'Connection: close' header if it exists, close the connection here
 
 
-
-    def write(self, data):
+    def _write(self, data):
 
         # Un-Chunked response
         length = len(data)
@@ -422,6 +470,10 @@ class HTTPSocket(object):
 
         # Compose the response
         return self.file.write(compose_response_header(self.version, self.status, self.reason, self.headers))
+    
+    # Preserve the original read/write
+    read = _read
+    write =_write
 
 
 class Request(HTTPSocket):
