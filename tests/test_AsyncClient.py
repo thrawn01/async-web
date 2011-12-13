@@ -216,6 +216,8 @@ class AsyncServer(StreamServer):
         # Create the Response Object
         response = Response(fd, {}, version=11, status=200, reason='OK')
         try:
+            # TODO: Refactor this like the 'Frame' class ????
+
             # Parse the request line 
             (method, path, version) = parse_request_line(fd)
             # Parse the response headers
@@ -254,8 +256,61 @@ class AsyncServer(StreamServer):
 
 
 # Create a Named Tuple (Class)
-Frame = namedtuple('Frame', ['data', 'header', 'extended'])
-    
+   
+class Frame(namedtuple('Frame', ['data', 'header'])):
+    """ 
+        data        is a String
+        header      is a 16bit integer
+    """
+
+    @staticmethod
+    def parseFrame(read):
+        # Read the 2 byte frame header
+        header = unpack_from('!H', read(2))
+        # Last 7 bits of the header consitute the length
+        length = header & 0x7F
+
+        if length == 126:
+            # If the length is 126, unpack the next 2 bytes
+            length = unpack_from('!H', read(2))
+
+        if length == 127:
+            # If the length is 127, unpack the next 8 bytes
+            length = unpack_from('!L', read(8))
+
+        # Read in the entire frame
+        return Frame(read(length), header)
+
+
+    @staticmethod
+    def createFrame(data):
+        (header, length) = (0, len(data))
+
+        # XXX: Add addtional flags to the header here
+        return Frame(data, header)
+
+
+    def compose(self):
+        frame = tuple(self)
+        length = len(frame[0])
+        extended = ''
+
+        # XXX: This code assumes only 64-bit integers are possible on this platform
+        if length > 65535:
+            # Pack length as a 64-bit unsigned
+            extended = struct.pack("!Q", length)
+            frame[1] |= 127
+
+        elif length >= 126:
+            # Pack length as a 16-bit unsigned
+            extended = struct.pack("!H", length)
+            frame[1] |= 126
+        else:
+            frame[1] |= length
+
+        return ''.join(struct.pack("!cc", frame[1]), extended, frame[0])
+
+
 
 class WebSocket(object):
     """ Websocket filter for hybi draft websocket protocol """
@@ -331,58 +386,18 @@ class WebSocket(object):
         return _next(request, response)
 
 
-    def parseFrame(self, read):
-        # Read the 2 byte frame header
-        header = unpack_from('!H', read(2))
-        # Last 7 bits of the header consitute the length
-        length = header & 0x7F
-
-        if length == 126:
-            # If the length is 126, unpack the next 2 bytes
-            length = unpack_from('!H', read(2))
-
-        if length == 127:
-            # If the length is 127, unpack the next 8 bytes
-            length = unpack_from('!L', read(8))
-
-        # Read in the entire frame
-        return Frame(read(length), header, length)
-
-
-    def composeFrame(self, data):
-        (header, extended, length) = (0, 0, len(data))
-
-        # XXX: This code assumes only 64-bit integers are possible on this platform
-        # If length is larger then 16bit unsigned
-        if length > 65535:
-            # Pack length as a 64-bit unsigned
-            extended = struct.pack("!Q", length)
-            header = 127
-        # If length is larger then 8 bit unsigned
-        elif length >= 126:
-            # Pack length as a 16-bit unsigned
-            extended = struct.pack("!H", length)
-            header = 126
-        else:
-            header = length
-
-        # XXX: Add addtional flags to the header here
-
-        return Frame(data, struct.pack("!cc", header), extended)
-
-    
     def read(self, read):
         # Parse the frame into a tuple
-        frame = self.parseFrame(read)
+        frame = Frame.parseFrame(read)
         # Return the data in the frame
         return frame
 
 
     def write(self, data, write):
         # Create a frame as a tuple
-        frame = self.composeFrame(data)
+        frame = Frame.createFrame(data)
         # Join the tuple and write the result
-        write(''.join(payload)) 
+        write(frame.compose()) 
 
 
 
