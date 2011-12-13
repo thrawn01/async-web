@@ -1,20 +1,23 @@
 
-git clone async-web
-cd async-web
-virtualenv --no-site-packages .
-source bin/activate
+# Ubuntu 11.04
+sudo apt-get install build-essential libevent-dev libyaml-dev mercurial
 
-# Install libevent ( OSX )
+# Install libevent ( For OSX )
 tar -vzxf libevent-1.4.14b-stable.tar.gz 
 cd libevent-1.4.14b-stable
 ./configure
 make -j4
 sudo make install
 
-pip install greenlet
+git clone async-web
+cd async-web
+virtualenv --no-site-packages .
+source bin/activate
+
 pip install gevent
 
 # XXX: Remove later
+cd ~
 hg clone https://bitbucket.org/denis/websocket
 cd websocket
 python setup.py install 
