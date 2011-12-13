@@ -8,8 +8,9 @@ from gevent import socket
 from gevent import pywsgi
 from gevent.server import StreamServer
 from StringIO import StringIO
-from collections import defaultdict, OrderedDict
+from collections import defaultdict
 import hashlib, base64, random, traceback, time, sys, os
+from utils import OrderedDict
 import gevent
 
 # XXX: Remove later
@@ -786,8 +787,8 @@ class TestAsyncServer(TestCase):
 
             self.assertEquals(socket.headers['connection'], 'Upgrade')
             self.assertEquals(socket.headers['upgrade'], 'websocket')
-            self.assertIn('date', socket.headers)
-            self.assertIn('sec-websocket-accept', socket.headers)
+            self.assertTrue('date' in socket.headers)
+            self.assertTrue('sec-websocket-accept' in socket.headers)
             self.assertEquals(socket.status, 101)
             self.assertEquals(socket.reason, 'Switching Protocols')
 
