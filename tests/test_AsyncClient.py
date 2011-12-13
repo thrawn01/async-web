@@ -25,6 +25,8 @@ WEEK_DAY_NAME = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 MONTH_NAME = [None,  # Dummy so we can use 1-based month numbers
               "Jan", "Feb", "Mar", "Apr", "May", "Jun",
               "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+
 def http_date_time(timestamp):
     year, month, day, hh, mm, ss, wd, _y, _z = time.gmtime(timestamp)
     return "%s, %02d %3s %4d %02d:%02d:%02d GMT" % (WEEK_DAY_NAME[wd], day, MONTH_NAME[month], year, hh, mm, ss)
@@ -266,17 +268,17 @@ class Frame(namedtuple('Frame', ['data', 'header'])):
     @staticmethod
     def parseFrame(read):
         # Read the 2 byte frame header
-        header = unpack_from('!H', read(2))
+        header = struct.unpack_from('!H', read(2))
         # Last 7 bits of the header consitute the length
         length = header & 0x7F
 
         if length == 126:
             # If the length is 126, unpack the next 2 bytes
-            length = unpack_from('!H', read(2))
+            length = struct.unpack_from('!H', read(2))
 
         if length == 127:
             # If the length is 127, unpack the next 8 bytes
-            length = unpack_from('!L', read(8))
+            length = struct.unpack_from('!L', read(8))
 
         # Read in the entire frame
         return Frame(read(length), header)
@@ -291,24 +293,23 @@ class Frame(namedtuple('Frame', ['data', 'header'])):
 
 
     def compose(self):
-        frame = tuple(self)
-        length = len(frame[0])
+        length = len(self.data)
         extended = ''
 
         # XXX: This code assumes only 64-bit integers are possible on this platform
         if length > 65535:
             # Pack length as a 64-bit unsigned
             extended = struct.pack("!Q", length)
-            frame[1] |= 127
+            header = self.header | 127
 
         elif length >= 126:
             # Pack length as a 16-bit unsigned
             extended = struct.pack("!H", length)
-            frame[1] |= 126
+            header = self.header | 126
         else:
-            frame[1] |= length
+            header = self.header | length
 
-        return ''.join(struct.pack("!cc", frame[1]), extended, frame[0])
+        return ''.join((struct.pack("!H", header), extended, self.data))
 
 
 
@@ -377,12 +378,19 @@ class WebSocket(object):
         # Do this so we don't have a partial handshake, as the handler might 
         # wait for requests instead of issuing a response
         response.write('')
-      
-        # Replace write with our version of write
-        response.write = lambda data: self.write(data, response.write)
-
-        # Match the path with a handler, and start handling websocket messages
-        self.routes[request.path](request, response)
+        #_write = response.write 
+        
+        #print "saved: ", _write
+        #print "current: ", response.write
+        #print "========="
+        ## Replace write with our version of write
+        #response.write = lambda data: self.write(data, _write)
+#
+        #print "saved: ", _write
+        #print "current: ", response.write
+#
+        ## Match the path with a handler, and start handling websocket messages
+        #self.routes[request.path](request, response)
         return _next(request, response)
 
 
@@ -594,7 +602,16 @@ class AsyncClient(object):
         except KeyError:
             raise RuntimeError('Missing headers in response; expected (upgrade, connection, sec-websocket-accept) got (%s)' % ','.join(headers.keys()))
              
+        _read = response.read 
+        response.read = lambda : self.read(response.file.read)
         return response
+
+
+    def read(self, read):
+        # Parse the frame into a tuple
+        frame = Frame.parseFrame(read)
+        # Return the data in the frame
+        return frame
 
 
 class TestAsyncClientWebSocket(TestCase):
@@ -849,20 +866,19 @@ class TestAsyncServer(TestCase):
         server = AsyncServer(('127.0.0.1', 15001), (web_socket,))
         server.start()
 
-        try:
-            socket = AsyncClient().websocket('http://127.0.0.1:15001/')
+        #try:
+        socket = AsyncClient().websocket('http://127.0.0.1:15001/')
 
-            self.assertEquals(socket.headers['connection'], 'Upgrade')
-            self.assertEquals(socket.headers['upgrade'], 'websocket')
-            self.assertTrue('date' in socket.headers)
-            self.assertTrue('sec-websocket-accept' in socket.headers)
-            self.assertEquals(socket.status, 101)
-            self.assertEquals(socket.reason, 'Switching Protocols')
+        self.assertEquals(socket.headers['connection'], 'Upgrade')
+        self.assertEquals(socket.headers['upgrade'], 'websocket')
+        self.assertTrue('date' in socket.headers)
+        self.assertTrue('sec-websocket-accept' in socket.headers)
+        self.assertEquals(socket.status, 101)
+        self.assertEquals(socket.reason, 'Switching Protocols')
+        self.assertEquals(socket.read(),'hello world')
 
-            self.assertEquals(socket.read(),'hello world')
-
-        except HTTPException, e:
-            print "Status: %s Reason: %s" % (e.status, e.reason)
+        #except HTTPException, e:
+            #print "HTTP Exception Caught - Status: %s Reason: %s" % (e.status, e.reason)
 
         self.stop(server)
 
