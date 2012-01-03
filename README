@@ -5,7 +5,7 @@ sudo apt-get install build-essential libevent-dev libyaml-dev mercurial
 # Install libevent ( For OSX )
 tar -vzxf libevent-1.4.14b-stable.tar.gz 
 cd libevent-1.4.14b-stable
-./configure
+./configure --prefix=/usr/local
 make -j4
 sudo make install
 
@@ -15,6 +15,7 @@ virtualenv --no-site-packages .
 source bin/activate
 
 pip install gevent
+pip install pip
 
 # XXX: Remove later
 cd ~
