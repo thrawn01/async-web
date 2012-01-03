@@ -17,9 +17,3 @@ source bin/activate
 pip install gevent
 pip install pip
 
-# XXX: Remove later
-cd ~
-hg clone https://bitbucket.org/denis/websocket
-cd websocket
-python setup.py install 
-
